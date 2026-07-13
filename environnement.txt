@@ -1,0 +1,15 @@
+========== SYSTÈME ==========
+Distribution : Ubuntu 26.04 LTS
+Architecture : x86_64
+Noyau Linux  : 7.0.0-27-generic
+Session      : wayland
+Bureau       : ubuntu:GNOME
+
+========== OUTILS ==========
+Rust         : absent
+Cargo        : absent
+2.5.1
+
+========== INTERFACE ==========
+GTK 4        : absent
+Libadwaita   : absent
