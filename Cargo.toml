@@ -19,5 +19,5 @@ gtk = { package = "gtk4", version = "0.11.4", features = ["v4_8"] }
 directories = "6.0.0"
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 sha2 = "0.11.0"
-ashpd = { version = "0.13.12", default-features = false, features = ["async-io", "global_shortcuts"] }
+ashpd = { version = "0.13.12", default-features = false, features = ["async-io", "global_shortcuts", "gtk4_wayland", "gtk4_x11"] }
 futures-util = "0.3.32"

@@ -1,3 +1,5 @@
+mod installer;
+
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
@@ -1595,17 +1597,6 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     let header_bar = adw::HeaderBar::new();
     header_bar.set_title_widget(Some(&header_title));
 
-    let quit_button = gtk::Button::from_icon_name("application-exit-symbolic");
-    quit_button.set_tooltip_text(Some("Quitter complètement ClipH"));
-    quit_button.add_css_class("flat");
-
-    let app_for_quit = app.clone();
-    quit_button.connect_clicked(move |_| {
-        app_for_quit.quit();
-    });
-
-    header_bar.pack_end(&quit_button);
-
     let title = gtk::Label::new(Some("Historique du presse-papiers"));
     title.set_halign(Align::Start);
     title.add_css_class("title-2");
@@ -1693,6 +1684,15 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
         .build();
 
     window.set_hide_on_close(true);
+
+    /*
+     * La croix ne termine jamais ClipH.
+     * Elle masque seulement sa fenêtre.
+     */
+    window.connect_close_request(|window| {
+        window.hide();
+        glib::Propagation::Stop
+    });
 
     let clear_menu_button = gtk::MenuButton::new();
     clear_menu_button.set_icon_name("edit-delete-symbolic");
@@ -1871,7 +1871,7 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     }
 }
 
-fn main() -> glib::ExitCode {
+fn run_application() -> glib::ExitCode {
     let start_hidden = std::env::args_os().any(|argument| argument == "--background");
 
     let app = adw::Application::builder().application_id(APP_ID).build();
@@ -1885,4 +1885,12 @@ fn main() -> glib::ExitCode {
     });
 
     app.run_with_args(&["cliph"])
+}
+
+fn main() -> glib::ExitCode {
+    if let Some(exit_code) = installer::dispatch_cli() {
+        std::process::exit(exit_code);
+    }
+
+    run_application()
 }
