@@ -1,13 +1,15 @@
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use adw::prelude::*;
 use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
 use cliph_core::{
     ClipboardClassification, ClipboardFormatPayload, ClipboardItem, ClipboardItemKind, FilePayload,
-    FileTransferOperation,
+    FileTransferOperation, QuickInsertCategory, QuickInsertEntry, search_entries,
 };
 use cliph_storage::{ClipboardStorage, MAX_FORMAT_PAYLOAD_BYTES, MAX_IMAGE_BYTES};
 use futures_util::StreamExt;
@@ -109,6 +111,18 @@ struct ClipboardCaptureContext {
     counter_label: gtk::Label,
     displayed_history: DisplayedHistory,
     toast_overlay: adw::ToastOverlay,
+}
+
+#[derive(Clone)]
+struct QuickInsertUiContext {
+    storage: Rc<ClipboardStorage>,
+    history_list: gtk::ListBox,
+    empty_state: gtk::Label,
+    counter_label: gtk::Label,
+    displayed_history: DisplayedHistory,
+    toast_overlay: adw::ToastOverlay,
+    clipboard: gdk::Clipboard,
+    window: adw::ApplicationWindow,
 }
 
 fn show_toast(toast_overlay: &adw::ToastOverlay, message: &str) {
@@ -224,14 +238,7 @@ fn publish_item_to_clipboard(
             let file_list = gdk::FileList::from_array(&gio_files);
             let file_list_value = file_list.to_value();
 
-            let uri_list = format!(
-                "{}
-",
-                available_uris.join(
-                    "
-"
-                )
-            );
+            let uri_list = format!("{}\r\n", available_uris.join("\r\n"));
 
             /*
              * On restaure volontairement une opération de copie,
@@ -1224,6 +1231,246 @@ fn capture_clipboard_content(
     }
 }
 
+fn clear_box_children(container: &gtk::Box) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+}
+
+fn quick_insert_page_name(category: QuickInsertCategory) -> &'static str {
+    match category {
+        QuickInsertCategory::Emoji => "emoji",
+        QuickInsertCategory::Kaomoji => "kaomoji",
+        QuickInsertCategory::Symbol => "symbol",
+    }
+}
+
+fn quick_insert_description(category: QuickInsertCategory) -> &'static str {
+    match category {
+        QuickInsertCategory::Emoji => "Recherchez un émoji puis cliquez dessus pour le copier.",
+        QuickInsertCategory::Kaomoji => "Choisissez une expression japonaise prête à être collée.",
+        QuickInsertCategory::Symbol => {
+            "Retrouvez rapidement les signes mathématiques, techniques et typographiques."
+        }
+    }
+}
+
+fn create_quick_insert_button(
+    entry: &'static QuickInsertEntry,
+    context: &QuickInsertUiContext,
+) -> gtk::Button {
+    let value_label = gtk::Label::new(Some(entry.value));
+    value_label.set_halign(Align::Center);
+    value_label.set_valign(Align::Center);
+    value_label.set_margin_top(8);
+    value_label.set_margin_bottom(8);
+    value_label.set_margin_start(10);
+    value_label.set_margin_end(10);
+    value_label.set_selectable(false);
+
+    match entry.category {
+        QuickInsertCategory::Emoji => {
+            value_label.add_css_class("title-1");
+        }
+        QuickInsertCategory::Kaomoji => {
+            value_label.add_css_class("monospace");
+            value_label.add_css_class("title-4");
+        }
+        QuickInsertCategory::Symbol => {
+            value_label.add_css_class("title-2");
+        }
+    }
+
+    let button = gtk::Button::new();
+    button.set_child(Some(&value_label));
+    button.add_css_class("flat");
+    button.set_focus_on_click(false);
+    button.set_tooltip_text(Some(&format!("{} — cliquer pour copier", entry.label)));
+
+    let value = entry.value.to_owned();
+    let context = context.clone();
+
+    button.connect_clicked(move |_| {
+        context.clipboard.set_text(&value);
+
+        let mime_types = vec![
+            String::from("text/plain"),
+            String::from("text/plain;charset=utf-8"),
+        ];
+
+        match context
+            .storage
+            .save_text_with_payloads(&value, None, &mime_types, &[])
+        {
+            Ok(_) => {
+                refresh_history(
+                    &context.storage,
+                    &context.history_list,
+                    &context.empty_state,
+                    &context.counter_label,
+                    &context.displayed_history,
+                    &context.toast_overlay,
+                );
+            }
+            Err(error) => {
+                eprintln!("Impossible d’ajouter l’insertion rapide à l’historique : {error}");
+            }
+        }
+
+        show_toast(
+            &context.toast_overlay,
+            &format!("{value} copié — utilisez Ctrl + V pour l’insérer"),
+        );
+
+        let window = context.window.clone();
+        glib::timeout_add_local_once(Duration::from_millis(350), move || window.hide());
+    });
+
+    button
+}
+
+fn populate_quick_insert_results(
+    category: QuickInsertCategory,
+    query: &str,
+    results_container: &gtk::Box,
+    result_count_label: &gtk::Label,
+    context: &QuickInsertUiContext,
+) {
+    clear_box_children(results_container);
+
+    let entries = search_entries(category, query, 500);
+
+    let count_text = match entries.len() {
+        0 => String::from("Aucun résultat"),
+        1 => String::from("1 résultat"),
+        count => format!("{count} résultats"),
+    };
+    result_count_label.set_text(&count_text);
+
+    if entries.is_empty() {
+        let empty_label = gtk::Label::new(Some("Aucun élément ne correspond à cette recherche."));
+        empty_label.set_halign(Align::Center);
+        empty_label.set_valign(Align::Center);
+        empty_label.set_vexpand(true);
+        empty_label.set_wrap(true);
+        empty_label.add_css_class("dim-label");
+
+        results_container.append(&empty_label);
+        return;
+    }
+
+    let mut groups: BTreeMap<&'static str, Vec<&'static QuickInsertEntry>> = BTreeMap::new();
+
+    for entry in entries {
+        groups.entry(entry.group).or_default().push(entry);
+    }
+
+    for (group_name, group_entries) in groups {
+        let group_label = gtk::Label::new(Some(group_name));
+        group_label.set_halign(Align::Start);
+        group_label.set_xalign(0.0);
+        group_label.add_css_class("heading");
+
+        let flow_box = gtk::FlowBox::new();
+        flow_box.set_halign(Align::Fill);
+        flow_box.set_hexpand(true);
+        flow_box.set_selection_mode(gtk::SelectionMode::None);
+        flow_box.set_activate_on_single_click(false);
+        flow_box.set_column_spacing(6);
+        flow_box.set_row_spacing(6);
+        flow_box.set_min_children_per_line(4);
+        flow_box.set_max_children_per_line(10);
+
+        for entry in group_entries {
+            let button = create_quick_insert_button(entry, context);
+            flow_box.insert(&button, -1);
+        }
+
+        let section = gtk::Box::new(Orientation::Vertical, 8);
+        section.append(&group_label);
+        section.append(&flow_box);
+
+        results_container.append(&section);
+    }
+}
+
+fn create_quick_insert_page(
+    category: QuickInsertCategory,
+    context: QuickInsertUiContext,
+) -> gtk::Box {
+    let title = gtk::Label::new(Some(category.display_label()));
+    title.set_halign(Align::Start);
+    title.set_xalign(0.0);
+    title.add_css_class("title-2");
+
+    let description = gtk::Label::new(Some(quick_insert_description(category)));
+    description.set_halign(Align::Start);
+    description.set_xalign(0.0);
+    description.set_wrap(true);
+    description.add_css_class("dim-label");
+
+    let search_entry = gtk::SearchEntry::new();
+    search_entry.set_hexpand(true);
+    search_entry.set_placeholder_text(Some(&format!(
+        "Rechercher dans {}…",
+        category.display_label().to_lowercase()
+    )));
+
+    let result_count_label = gtk::Label::new(None);
+    result_count_label.set_halign(Align::Start);
+    result_count_label.add_css_class("caption");
+    result_count_label.add_css_class("dim-label");
+
+    let introduction = gtk::Box::new(Orientation::Vertical, 8);
+    introduction.append(&title);
+    introduction.append(&description);
+    introduction.append(&search_entry);
+    introduction.append(&result_count_label);
+
+    let results_container = gtk::Box::new(Orientation::Vertical, 20);
+    results_container.set_hexpand(true);
+    results_container.set_vexpand(true);
+
+    populate_quick_insert_results(
+        category,
+        "",
+        &results_container,
+        &result_count_label,
+        &context,
+    );
+
+    let results_for_search = results_container.clone();
+    let count_for_search = result_count_label.clone();
+    let context_for_search = context.clone();
+
+    search_entry.connect_search_changed(move |entry| {
+        populate_quick_insert_results(
+            category,
+            entry.text().as_str(),
+            &results_for_search,
+            &count_for_search,
+            &context_for_search,
+        );
+    });
+
+    let scrolled_window = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .child(&results_container)
+        .build();
+
+    let page = gtk::Box::new(Orientation::Vertical, 16);
+    page.set_margin_top(20);
+    page.set_margin_bottom(20);
+    page.set_margin_start(24);
+    page.set_margin_end(24);
+    page.append(&introduction);
+    page.append(&scrolled_window);
+
+    page
+}
+
 fn show_startup_error(app: &adw::Application, message: &str) {
     let title = gtk::Label::new(Some("ClipH ne peut pas démarrer"));
     title.add_css_class("title-2");
@@ -1407,13 +1654,28 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
         .child(&history_container)
         .build();
 
-    let content = gtk::Box::new(Orientation::Vertical, 18);
-    content.set_margin_top(24);
-    content.set_margin_bottom(24);
-    content.set_margin_start(24);
-    content.set_margin_end(24);
-    content.append(&introduction);
-    content.append(&scrolled_window);
+    let history_page = gtk::Box::new(Orientation::Vertical, 18);
+    history_page.set_margin_top(20);
+    history_page.set_margin_bottom(20);
+    history_page.set_margin_start(24);
+    history_page.set_margin_end(24);
+    history_page.append(&introduction);
+    history_page.append(&scrolled_window);
+
+    let view_stack = gtk::Stack::new();
+    view_stack.set_hexpand(true);
+    view_stack.set_vexpand(true);
+    view_stack.set_transition_type(gtk::StackTransitionType::SlideLeftRight);
+    view_stack.add_titled(&history_page, Some("history"), "Historique");
+
+    let view_switcher = gtk::StackSwitcher::new();
+    view_switcher.set_halign(Align::Center);
+    view_switcher.set_stack(Some(&view_stack));
+
+    let content = gtk::Box::new(Orientation::Vertical, 10);
+    content.set_margin_top(12);
+    content.append(&view_switcher);
+    content.append(&view_stack);
 
     let page = gtk::Box::new(Orientation::Vertical, 0);
     page.append(&header_bar);
@@ -1516,6 +1778,31 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     let display =
         gdk::Display::default().expect("ClipH ne peut pas accéder à l’affichage graphique.");
     let clipboard = display.clipboard();
+
+    let quick_insert_context = QuickInsertUiContext {
+        storage: storage.clone(),
+        history_list: history_list.clone(),
+        empty_state: empty_state.clone(),
+        counter_label: counter_label.clone(),
+        displayed_history: displayed_history.clone(),
+        toast_overlay: toast_overlay.clone(),
+        clipboard: clipboard.clone(),
+        window: window.clone(),
+    };
+
+    for category in [
+        QuickInsertCategory::Emoji,
+        QuickInsertCategory::Kaomoji,
+        QuickInsertCategory::Symbol,
+    ] {
+        let quick_page = create_quick_insert_page(category, quick_insert_context.clone());
+
+        view_stack.add_titled(
+            &quick_page,
+            Some(quick_insert_page_name(category)),
+            category.display_label(),
+        );
+    }
 
     let displayed_for_activation = displayed_history.clone();
     let clipboard_for_activation = clipboard.clone();

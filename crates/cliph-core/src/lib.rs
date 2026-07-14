@@ -4,7 +4,13 @@ use std::path::{Path, PathBuf};
 
 pub mod classifier;
 
+pub mod quick_insert;
 pub use classifier::{ClassificationResult, ClipboardClassification, classify_text};
+
+pub use quick_insert::{
+    QuickInsertCategory, QuickInsertEntry, catalog, entries_for_category, find_entry_by_value,
+    groups_for_category, search_entries,
+};
 
 /// Représentation MIME binaire conservée pour un élément textuel.
 #[derive(Debug, Clone, PartialEq, Eq)]
