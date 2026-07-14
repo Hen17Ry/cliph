@@ -1,0 +1,5 @@
+unicode=17.0.0
+emoji=17.0
+cldr=48.2
+emoji_count=3953
+symbol_count=8260
