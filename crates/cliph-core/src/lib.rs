@@ -6,6 +6,26 @@ pub mod classifier;
 
 pub use classifier::{ClassificationResult, ClipboardClassification, classify_text};
 
+/// Représentation MIME binaire conservée pour un élément textuel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardFormatPayload {
+    pub mime_type: String,
+    pub data: Vec<u8>,
+}
+
+impl ClipboardFormatPayload {
+    pub fn new(mime_type: impl Into<String>, data: Vec<u8>) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            data,
+        }
+    }
+
+    pub fn byte_size(&self) -> usize {
+        self.data.len()
+    }
+}
+
 /// Type technique principal d'un élément enregistré.
 ///
 /// La classification sémantique est conservée séparément dans

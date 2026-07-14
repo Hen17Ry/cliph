@@ -4,8 +4,10 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
-use cliph_core::{ClipboardClassification, ClipboardItem, ClipboardItemKind};
-use cliph_storage::{ClipboardStorage, MAX_IMAGE_BYTES};
+use cliph_core::{
+    ClipboardClassification, ClipboardFormatPayload, ClipboardItem, ClipboardItemKind,
+};
+use cliph_storage::{ClipboardStorage, MAX_FORMAT_PAYLOAD_BYTES, MAX_IMAGE_BYTES};
 use futures_util::StreamExt;
 use gtk::glib::types::StaticType;
 use gtk::{Align, Orientation, gdk, gio, glib};
@@ -14,18 +16,21 @@ const APP_ID: &str = "com.cliph.ClipH";
 const DISPLAYED_HISTORY_LIMIT: usize = 200;
 const GLOBAL_SHORTCUT_ID: &str = "toggle-cliph";
 const GLOBAL_SHORTCUT_TRIGGER: &str = "LOGO+h";
-const MAX_RICH_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const HTML_MIME_TYPES: &[&str] = &[
     "text/html",
     "text/html;charset=utf-8",
     "text/html;charset=UTF-8",
 ];
+const RTF_MIME_TYPES: &[&str] = &["text/rtf", "application/rtf", "application/x-rtf"];
+const TSV_MIME_TYPES: &[&str] = &["text/tab-separated-values"];
+const CSV_MIME_TYPES: &[&str] = &["text/csv", "application/csv"];
 
 #[derive(Debug, Clone)]
 enum DisplayedPayload {
     Text {
         plain_text: String,
         html_text: Option<String>,
+        format_payloads: Vec<ClipboardFormatPayload>,
     },
     Image {
         path: Option<PathBuf>,
@@ -39,11 +44,12 @@ struct DisplayedItem {
 }
 
 impl DisplayedItem {
-    fn from_item(item: &ClipboardItem) -> Self {
+    fn from_item(item: &ClipboardItem, format_payloads: Vec<ClipboardFormatPayload>) -> Self {
         let payload = match item.kind {
             ClipboardItemKind::Text => DisplayedPayload::Text {
                 plain_text: item.plain_text.clone(),
                 html_text: item.html_text.clone(),
+                format_payloads,
             },
             ClipboardItemKind::Image => {
                 if let Some(image) = &item.image {
@@ -57,6 +63,7 @@ impl DisplayedItem {
             ClipboardItemKind::Files => DisplayedPayload::Text {
                 plain_text: item.plain_text.clone(),
                 html_text: None,
+                format_payloads,
             },
         };
 
@@ -71,6 +78,7 @@ impl DisplayedItem {
 enum PublishedKind {
     PlainText,
     RichText,
+    MultiFormat,
     Image,
 }
 
@@ -79,6 +87,7 @@ impl PublishedKind {
         match self {
             Self::PlainText => "Élément copié — utilisez Ctrl + V pour le coller",
             Self::RichText => "Texte enrichi copié — formatage conservé",
+            Self::MultiFormat => "Contenu copié — tous les formats disponibles sont restaurés",
             Self::Image => "Image copiée — utilisez Ctrl + V pour la coller",
         }
     }
@@ -122,24 +131,53 @@ fn publish_item_to_clipboard(
         DisplayedPayload::Text {
             plain_text,
             html_text,
+            format_payloads,
         } => {
-            let Some(html_text) = html_text.as_deref().filter(|html| !html.trim().is_empty())
-            else {
+            let mut providers = Vec::new();
+            let mut has_html = false;
+            let mut has_non_html_payload = false;
+
+            for payload in format_payloads {
+                if payload.data.is_empty() {
+                    continue;
+                }
+
+                has_html |= payload.mime_type == "text/html";
+                has_non_html_payload |= payload.mime_type != "text/html";
+
+                let bytes = glib::Bytes::from_owned(payload.data.clone());
+                providers.push(gdk::ContentProvider::for_bytes(&payload.mime_type, &bytes));
+            }
+
+            if !has_html
+                && let Some(html_text) = html_text.as_deref().filter(|html| !html.trim().is_empty())
+            {
+                let html_bytes = glib::Bytes::from_owned(html_text.as_bytes().to_vec());
+
+                providers.push(gdk::ContentProvider::for_bytes("text/html", &html_bytes));
+
+                has_html = true;
+            }
+
+            if !has_html && !has_non_html_payload {
                 clipboard.set_text(plain_text);
                 return Ok(PublishedKind::PlainText);
-            };
+            }
 
             let plain_value = plain_text.to_value();
-            let plain_provider = gdk::ContentProvider::for_value(&plain_value);
-            let html_bytes = glib::Bytes::from_owned(html_text.as_bytes().to_vec());
-            let html_provider = gdk::ContentProvider::for_bytes("text/html", &html_bytes);
-            let provider = gdk::ContentProvider::new_union(&[html_provider, plain_provider]);
+            providers.push(gdk::ContentProvider::for_value(&plain_value));
+
+            let provider = gdk::ContentProvider::new_union(&providers);
 
             clipboard
                 .set_content(Some(&provider))
                 .map_err(|error| error.to_string())?;
 
-            Ok(PublishedKind::RichText)
+            if has_non_html_payload {
+                Ok(PublishedKind::MultiFormat)
+            } else {
+                Ok(PublishedKind::RichText)
+            }
         }
         DisplayedPayload::Image { path, .. } => {
             let path = path
@@ -440,11 +478,29 @@ fn refresh_history(
         Ok(items) => {
             clear_history_list(history_list);
 
-            {
-                let mut displayed_items = displayed_history.borrow_mut();
-                displayed_items.clear();
-                displayed_items.extend(items.iter().map(DisplayedItem::from_item));
-            }
+            let displayed_items = items
+                .iter()
+                .map(|item| {
+                    let format_payloads = if item.kind == ClipboardItemKind::Text {
+                        match storage.load_format_payloads(item.id) {
+                            Ok(payloads) => payloads,
+                            Err(error) => {
+                                eprintln!(
+                                    "Impossible de charger les formats de l’élément {} : {error}",
+                                    item.id,
+                                );
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
+
+                    DisplayedItem::from_item(item, format_payloads)
+                })
+                .collect::<Vec<_>>();
+
+            *displayed_history.borrow_mut() = displayed_items;
 
             for item in &items {
                 let row = create_history_row(
@@ -474,29 +530,39 @@ fn refresh_history(
     }
 }
 
-async fn read_html_from_clipboard(clipboard: &gdk::Clipboard) -> Option<String> {
-    let contains_html = clipboard
-        .formats()
-        .mime_types()
-        .iter()
-        .any(|mime_type| mime_type.as_str().starts_with("text/html"));
+fn clipboard_has_any_mime_type(
+    available_mime_types: &[String],
+    accepted_mime_types: &[&str],
+) -> bool {
+    available_mime_types.iter().any(|available| {
+        accepted_mime_types
+            .iter()
+            .any(|accepted| available.eq_ignore_ascii_case(accepted))
+    })
+}
 
-    if !contains_html {
+async fn read_format_payload(
+    clipboard: &gdk::Clipboard,
+    available_mime_types: &[String],
+    accepted_mime_types: &[&str],
+    canonical_mime_type: &str,
+) -> Option<ClipboardFormatPayload> {
+    if !clipboard_has_any_mime_type(available_mime_types, accepted_mime_types) {
         return None;
     }
 
     let (stream, _selected_mime_type) = match clipboard
-        .read_future(HTML_MIME_TYPES, glib::Priority::DEFAULT)
+        .read_future(accepted_mime_types, glib::Priority::DEFAULT)
         .await
     {
         Ok(result) => result,
         Err(error) => {
-            eprintln!("Impossible de lire le format HTML : {error}");
+            eprintln!("Impossible de lire le format {canonical_mime_type} : {error}");
             return None;
         }
     };
 
-    let buffer = vec![0_u8; MAX_RICH_TEXT_BYTES];
+    let buffer = vec![0_u8; MAX_FORMAT_PAYLOAD_BYTES + 1];
 
     let (buffer, bytes_read, partial_error) = match stream
         .read_all_future(buffer, glib::Priority::DEFAULT)
@@ -504,28 +570,93 @@ async fn read_html_from_clipboard(clipboard: &gdk::Clipboard) -> Option<String> 
     {
         Ok(result) => result,
         Err((_buffer, error)) => {
-            eprintln!("Impossible de lire les données HTML : {error}");
+            eprintln!("Impossible de lire les données {canonical_mime_type} : {error}");
             return None;
         }
     };
 
     if let Some(error) = partial_error {
-        eprintln!("Lecture HTML partielle : {error}");
+        eprintln!("Lecture partielle du format {canonical_mime_type} : {error}");
     }
 
     if bytes_read == 0 {
         return None;
     }
 
-    let html_text = String::from_utf8_lossy(&buffer[..bytes_read])
+    if bytes_read > MAX_FORMAT_PAYLOAD_BYTES {
+        eprintln!(
+            "Format {canonical_mime_type} ignoré : limite de {} octets dépassée",
+            MAX_FORMAT_PAYLOAD_BYTES,
+        );
+        return None;
+    }
+
+    let mut data = buffer[..bytes_read].to_vec();
+
+    while data.last() == Some(&0) {
+        data.pop();
+    }
+
+    if data.is_empty() {
+        return None;
+    }
+
+    Some(ClipboardFormatPayload::new(canonical_mime_type, data))
+}
+
+async fn read_text_format_payloads(
+    clipboard: &gdk::Clipboard,
+    available_mime_types: &[String],
+) -> Vec<ClipboardFormatPayload> {
+    let mut payloads = Vec::new();
+
+    if let Some(payload) = read_format_payload(
+        clipboard,
+        available_mime_types,
+        HTML_MIME_TYPES,
+        "text/html",
+    )
+    .await
+    {
+        payloads.push(payload);
+    }
+
+    if let Some(payload) =
+        read_format_payload(clipboard, available_mime_types, RTF_MIME_TYPES, "text/rtf").await
+    {
+        payloads.push(payload);
+    }
+
+    if let Some(payload) = read_format_payload(
+        clipboard,
+        available_mime_types,
+        TSV_MIME_TYPES,
+        "text/tab-separated-values",
+    )
+    .await
+    {
+        payloads.push(payload);
+    }
+
+    if let Some(payload) =
+        read_format_payload(clipboard, available_mime_types, CSV_MIME_TYPES, "text/csv").await
+    {
+        payloads.push(payload);
+    }
+
+    payloads
+}
+
+fn html_text_from_payloads(payloads: &[ClipboardFormatPayload]) -> Option<String> {
+    let payload = payloads
+        .iter()
+        .find(|payload| payload.mime_type == "text/html")?;
+
+    let html_text = String::from_utf8_lossy(&payload.data)
         .trim_end_matches('\0')
         .to_string();
 
-    if html_text.trim().is_empty() {
-        None
-    } else {
-        Some(html_text)
-    }
+    (!html_text.trim().is_empty()).then_some(html_text)
 }
 
 fn capture_image_content(
@@ -595,12 +726,15 @@ fn capture_text_content(
             return;
         }
 
-        let html_text = read_html_from_clipboard(&clipboard).await;
+        let payloads = read_text_format_payloads(&clipboard, &available_mime_types).await;
 
-        match context.storage.save_text_with_formats(
+        let html_text = html_text_from_payloads(&payloads);
+
+        match context.storage.save_text_with_payloads(
             &plain_text,
             html_text.as_deref(),
             &available_mime_types,
+            &payloads,
         ) {
             Ok(_) => {
                 refresh_history(
@@ -612,9 +746,13 @@ fn capture_text_content(
                     &context.toast_overlay,
                 );
             }
-
             Err(error) => {
                 eprintln!("Impossible d’enregistrer le contenu du presse-papiers : {error}");
+
+                show_toast(
+                    &context.toast_overlay,
+                    "Impossible d’enregistrer tous les formats de ce contenu",
+                );
             }
         }
     });

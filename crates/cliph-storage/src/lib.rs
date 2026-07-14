@@ -7,22 +7,30 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 
 use cliph_core::{
-    ClipboardClassification, ClipboardItem, ClipboardItemKind, ImagePayload, classify_text,
+    ClipboardClassification, ClipboardFormatPayload, ClipboardItem, ClipboardItemKind,
+    ImagePayload, classify_text,
 };
 use directories::ProjectDirs;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
 const RICH_TEXT_MIGRATION: &str = include_str!("../migrations/0002_rich_text.sql");
 const IMAGE_HISTORY_MIGRATION: &str = include_str!("../migrations/0003_image_history.sql");
 const CLASSIFICATION_MIGRATION: &str =
     include_str!("../migrations/0004_classification_metadata.sql");
+const MULTIFORMAT_MIGRATION: &str = include_str!("../migrations/0005_multiformat_payloads.sql");
 
 /// Limite de sécurité actuelle : 25 Mio par image.
 pub const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+
+/// Limite par représentation textuelle riche : 4 Mio.
+pub const MAX_FORMAT_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+
+/// Limite cumulée des représentations d'un même élément : 12 Mio.
+pub const MAX_TOTAL_FORMAT_PAYLOAD_BYTES: usize = 12 * 1024 * 1024;
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
@@ -37,10 +45,26 @@ pub enum StorageError {
     UnknownItemKind(String),
     UnknownClassification(String),
     InvalidClassificationConfidence(i64),
-    InvalidImageDimensions { width: i32, height: i32 },
+    InvalidImageDimensions {
+        width: i32,
+        height: i32,
+    },
     EmptyImage,
-    ImageTooLarge { actual: usize, maximum: usize },
+    ImageTooLarge {
+        actual: usize,
+        maximum: usize,
+    },
     InvalidStoredByteSize(i64),
+    FormatPayloadTooLarge {
+        mime_type: String,
+        actual: usize,
+        maximum: usize,
+    },
+    TotalFormatPayloadsTooLarge {
+        actual: usize,
+        maximum: usize,
+    },
+    InvalidStoredFormatByteSize(i64),
 }
 
 impl Display for StorageError {
@@ -87,6 +111,22 @@ impl Display for StorageError {
             Self::InvalidStoredByteSize(size) => {
                 write!(formatter, "taille d'image invalide dans la base : {size}")
             }
+            Self::FormatPayloadTooLarge {
+                mime_type,
+                actual,
+                maximum,
+            } => write!(
+                formatter,
+                "le format {mime_type} fait {actual} octets, limite autorisée : {maximum} octets"
+            ),
+            Self::TotalFormatPayloadsTooLarge { actual, maximum } => write!(
+                formatter,
+                "les formats textuels font {actual} octets au total, limite autorisée : {maximum} octets"
+            ),
+            Self::InvalidStoredFormatByteSize(size) => write!(
+                formatter,
+                "taille de représentation MIME invalide dans la base : {size}"
+            ),
         }
     }
 }
@@ -180,7 +220,7 @@ impl ClipboardStorage {
 
     /// Enregistre un texte simple.
     pub fn save_text(&self, plain_text: &str) -> StorageResult<ClipboardItem> {
-        self.save_text_with_formats(plain_text, None, &[String::from("text/plain")])
+        self.save_text_with_payloads(plain_text, None, &[String::from("text/plain")], &[])
     }
 
     /// Enregistre un texte et son éventuel HTML.
@@ -190,28 +230,55 @@ impl ClipboardStorage {
         html_text: Option<&str>,
     ) -> StorageResult<ClipboardItem> {
         let mut mime_types = vec![String::from("text/plain")];
+        let mut payloads = Vec::new();
 
-        if html_text.is_some_and(|html| !html.trim().is_empty()) {
+        if let Some(html_text) = html_text.filter(|html| !html.trim().is_empty()) {
             mime_types.push(String::from("text/html"));
+            payloads.push(ClipboardFormatPayload::new(
+                "text/html",
+                html_text.as_bytes().to_vec(),
+            ));
         }
 
-        self.save_text_with_formats(plain_text, html_text, &mime_types)
+        self.save_text_with_payloads(plain_text, html_text, &mime_types, &payloads)
     }
 
-    /// Enregistre un texte avec toutes les représentations MIME détectées.
+    /// Compatibilité avec l'API précédente.
     pub fn save_text_with_formats(
         &self,
         plain_text: &str,
         html_text: Option<&str>,
         mime_types: &[String],
     ) -> StorageResult<ClipboardItem> {
+        let payloads = html_text
+            .filter(|html| !html.trim().is_empty())
+            .map(|html| {
+                vec![ClipboardFormatPayload::new(
+                    "text/html",
+                    html.as_bytes().to_vec(),
+                )]
+            })
+            .unwrap_or_default();
+
+        self.save_text_with_payloads(plain_text, html_text, mime_types, &payloads)
+    }
+
+    /// Enregistre le texte et ses représentations HTML, RTF, TSV ou CSV.
+    pub fn save_text_with_payloads(
+        &self,
+        plain_text: &str,
+        html_text: Option<&str>,
+        mime_types: &[String],
+        payloads: &[ClipboardFormatPayload],
+    ) -> StorageResult<ClipboardItem> {
         let normalized_html = html_text.filter(|html| !html.trim().is_empty());
+        let normalized_payloads = normalize_format_payloads(payloads)?;
         let normalized_mime_types =
-            normalize_text_mime_types(mime_types, normalized_html.is_some());
+            normalize_text_mime_types(mime_types, normalized_html.is_some(), &normalized_payloads);
 
         let classification = classify_text(plain_text, normalized_html, &normalized_mime_types);
 
-        let content_hash = calculate_text_hash(plain_text, normalized_html);
+        let content_hash = calculate_text_hash(plain_text, normalized_html, &normalized_payloads);
         let now = current_timestamp_ns()?;
 
         self.connection.execute(
@@ -232,7 +299,10 @@ impl ClipboardStorage {
 
             ON CONFLICT(content_hash) DO UPDATE SET
                 plain_text = excluded.plain_text,
-                html_text = excluded.html_text,
+                html_text = COALESCE(
+                    excluded.html_text,
+                    clipboard_items.html_text
+                ),
                 last_used_at_ns = excluded.last_used_at_ns,
                 classification = excluded.classification,
                 classification_subtype = excluded.classification_subtype,
@@ -251,7 +321,8 @@ impl ClipboardStorage {
         )?;
 
         let item_id = self.item_id_by_hash(&content_hash)?;
-        self.replace_item_mime_types(item_id, &normalized_mime_types)?;
+        self.merge_item_mime_types(item_id, &normalized_mime_types)?;
+        self.merge_format_payloads(item_id, &normalized_payloads)?;
 
         self.find_by_hash(&content_hash)?
             .ok_or(rusqlite::Error::QueryReturnedNoRows.into())
@@ -351,7 +422,7 @@ impl ClipboardStorage {
             params![item_id, relative_path_string, width, height, byte_size,],
         )?;
 
-        self.replace_item_mime_types(item_id, &[String::from("image/png")])?;
+        self.merge_item_mime_types(item_id, &[String::from("image/png")])?;
 
         self.find_by_hash(&content_hash)?
             .ok_or(rusqlite::Error::QueryReturnedNoRows.into())
@@ -483,15 +554,7 @@ impl ClipboardStorage {
             .map_err(StorageError::from)
     }
 
-    fn replace_item_mime_types(&self, item_id: i64, mime_types: &[String]) -> StorageResult<()> {
-        self.connection.execute(
-            "
-            DELETE FROM clipboard_item_mime_types
-            WHERE item_id = ?1
-            ",
-            [item_id],
-        )?;
-
+    fn merge_item_mime_types(&self, item_id: i64, mime_types: &[String]) -> StorageResult<()> {
         for mime_type in mime_types {
             self.connection.execute(
                 "
@@ -506,6 +569,91 @@ impl ClipboardStorage {
         }
 
         Ok(())
+    }
+
+    fn merge_format_payloads(
+        &self,
+        item_id: i64,
+        payloads: &[ClipboardFormatPayload],
+    ) -> StorageResult<()> {
+        for payload in payloads {
+            let byte_size = i64::try_from(payload.data.len()).map_err(|_| {
+                StorageError::FormatPayloadTooLarge {
+                    mime_type: payload.mime_type.clone(),
+                    actual: payload.data.len(),
+                    maximum: MAX_FORMAT_PAYLOAD_BYTES,
+                }
+            })?;
+
+            self.connection.execute(
+                "
+                INSERT INTO clipboard_item_format_payloads (
+                    item_id,
+                    mime_type,
+                    data,
+                    byte_size
+                )
+                VALUES (?1, ?2, ?3, ?4)
+
+                ON CONFLICT(item_id, mime_type) DO UPDATE SET
+                    data = excluded.data,
+                    byte_size = excluded.byte_size
+                ",
+                params![item_id, &payload.mime_type, &payload.data, byte_size,],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Charge les représentations binaires nécessaires à une restauration fidèle.
+    pub fn load_format_payloads(&self, item_id: i64) -> StorageResult<Vec<ClipboardFormatPayload>> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT
+                mime_type,
+                data,
+                byte_size
+            FROM clipboard_item_format_payloads
+            WHERE item_id = ?1
+            ORDER BY mime_type ASC
+            ",
+        )?;
+
+        let payloads = statement
+            .query_map([item_id], |row| {
+                let mime_type: String = row.get(0)?;
+                let data: Vec<u8> = row.get(1)?;
+                let stored_byte_size: i64 = row.get(2)?;
+
+                let expected_byte_size =
+                    usize::try_from(stored_byte_size).map_err(|_| {
+                        conversion_error(
+                            2,
+                            rusqlite::types::Type::Integer,
+                            StorageError::InvalidStoredFormatByteSize(
+                                stored_byte_size,
+                            )
+                            .to_string(),
+                        )
+                    })?;
+
+                if expected_byte_size != data.len() {
+                    return Err(conversion_error(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        format!(
+                            "taille incohérente pour {mime_type} : base={expected_byte_size}, données={}",
+                            data.len()
+                        ),
+                    ));
+                }
+
+                Ok(ClipboardFormatPayload { mime_type, data })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(payloads)
     }
 
     fn find_by_hash(&self, content_hash: &str) -> StorageResult<Option<ClipboardItem>> {
@@ -580,6 +728,11 @@ impl ClipboardStorage {
         if schema_version == 3 {
             self.connection.execute_batch(CLASSIFICATION_MIGRATION)?;
             schema_version = 4;
+        }
+
+        if schema_version == 4 {
+            self.connection.execute_batch(MULTIFORMAT_MIGRATION)?;
+            schema_version = 5;
         }
 
         if schema_version != CURRENT_SCHEMA_VERSION {
@@ -696,12 +849,18 @@ fn conversion_error(
     )
 }
 
-fn normalize_text_mime_types(mime_types: &[String], contains_html: bool) -> Vec<String> {
+fn normalize_text_mime_types(
+    mime_types: &[String],
+    contains_html: bool,
+    payloads: &[ClipboardFormatPayload],
+) -> Vec<String> {
     let mut normalized = mime_types
         .iter()
-        .map(|mime_type| mime_type.trim().to_ascii_lowercase())
+        .map(|mime_type| canonical_text_mime_type(mime_type))
         .filter(|mime_type| !mime_type.is_empty())
         .collect::<Vec<_>>();
+
+    normalized.extend(payloads.iter().map(|payload| payload.mime_type.clone()));
 
     if !normalized
         .iter()
@@ -710,11 +869,7 @@ fn normalize_text_mime_types(mime_types: &[String], contains_html: bool) -> Vec<
         normalized.push(String::from("text/plain"));
     }
 
-    if contains_html
-        && !normalized
-            .iter()
-            .any(|mime_type| mime_type.starts_with("text/html"))
-    {
+    if contains_html && !normalized.iter().any(|mime_type| mime_type == "text/html") {
         normalized.push(String::from("text/html"));
     }
 
@@ -723,13 +878,106 @@ fn normalize_text_mime_types(mime_types: &[String], contains_html: bool) -> Vec<
     normalized
 }
 
+fn normalize_format_payloads(
+    payloads: &[ClipboardFormatPayload],
+) -> StorageResult<Vec<ClipboardFormatPayload>> {
+    let mut normalized: Vec<ClipboardFormatPayload> = Vec::new();
+    let mut total_byte_size = 0_usize;
+
+    for payload in payloads {
+        let mime_type = canonical_text_mime_type(&payload.mime_type);
+
+        if !is_persisted_text_payload_mime(&mime_type) || payload.data.is_empty() {
+            continue;
+        }
+
+        if payload.data.len() > MAX_FORMAT_PAYLOAD_BYTES {
+            return Err(StorageError::FormatPayloadTooLarge {
+                mime_type,
+                actual: payload.data.len(),
+                maximum: MAX_FORMAT_PAYLOAD_BYTES,
+            });
+        }
+
+        total_byte_size = total_byte_size.checked_add(payload.data.len()).ok_or(
+            StorageError::TotalFormatPayloadsTooLarge {
+                actual: usize::MAX,
+                maximum: MAX_TOTAL_FORMAT_PAYLOAD_BYTES,
+            },
+        )?;
+
+        if total_byte_size > MAX_TOTAL_FORMAT_PAYLOAD_BYTES {
+            return Err(StorageError::TotalFormatPayloadsTooLarge {
+                actual: total_byte_size,
+                maximum: MAX_TOTAL_FORMAT_PAYLOAD_BYTES,
+            });
+        }
+
+        if let Some(existing) = normalized
+            .iter_mut()
+            .find(|existing| existing.mime_type == mime_type)
+        {
+            existing.data.clone_from(&payload.data);
+        } else {
+            normalized.push(ClipboardFormatPayload {
+                mime_type,
+                data: payload.data.clone(),
+            });
+        }
+    }
+
+    normalized.sort_by(|left, right| left.mime_type.cmp(&right.mime_type));
+
+    Ok(normalized)
+}
+
+fn canonical_text_mime_type(mime_type: &str) -> String {
+    let mime_type = mime_type.trim().to_ascii_lowercase();
+
+    if mime_type.starts_with("text/html") {
+        return String::from("text/html");
+    }
+
+    if matches!(
+        mime_type.as_str(),
+        "text/rtf" | "application/rtf" | "application/x-rtf"
+    ) {
+        return String::from("text/rtf");
+    }
+
+    if mime_type == "text/tab-separated-values" {
+        return mime_type;
+    }
+
+    if matches!(mime_type.as_str(), "text/csv" | "application/csv") {
+        return String::from("text/csv");
+    }
+
+    if mime_type.starts_with("text/plain") {
+        return String::from("text/plain");
+    }
+
+    mime_type
+}
+
+fn is_persisted_text_payload_mime(mime_type: &str) -> bool {
+    matches!(
+        mime_type,
+        "text/html" | "text/rtf" | "text/tab-separated-values" | "text/csv"
+    )
+}
+
 fn current_timestamp_ns() -> StorageResult<i64> {
     let duration = SystemTime::now().duration_since(UNIX_EPOCH)?;
 
     i64::try_from(duration.as_nanos()).map_err(|_| StorageError::TimestampOverflow)
 }
 
-fn calculate_text_hash(plain_text: &str, html_text: Option<&str>) -> String {
+fn calculate_text_hash(
+    plain_text: &str,
+    html_text: Option<&str>,
+    payloads: &[ClipboardFormatPayload],
+) -> String {
     let mut hasher = Sha256::new();
 
     hasher.update(b"text\0");
@@ -738,6 +986,17 @@ fn calculate_text_hash(plain_text: &str, html_text: Option<&str>) -> String {
     if let Some(html_text) = html_text {
         hasher.update(b"\0html\0");
         hasher.update(html_text.as_bytes());
+    }
+
+    for payload in payloads {
+        if payload.mime_type == "text/html" && html_text.is_some() {
+            continue;
+        }
+
+        hasher.update(b"\0mime\0");
+        hasher.update(payload.mime_type.as_bytes());
+        hasher.update(b"\0data\0");
+        hasher.update(&payload.data);
     }
 
     format_digest(hasher.finalize())
@@ -993,6 +1252,99 @@ mod tests {
 
             assert_eq!(storage.count().expect("counting items"), 0);
             assert!(!image_path.exists());
+        }
+
+        fs::remove_dir_all(directory).expect("removing directory");
+    }
+    #[test]
+    fn multiformat_payloads_are_persistent() {
+        let directory = create_test_directory("cliph-multiformat-payload-test");
+        let database_path = directory.join("cliph.db");
+
+        let rtf = br"{\rtf1\ansi Bonjour ClipH}".to_vec();
+        let tsv = b"Nom\tAge\nAda\t25".to_vec();
+
+        let item_id;
+
+        {
+            let storage = ClipboardStorage::open(&database_path).expect("opening database");
+
+            let item = storage
+                .save_text_with_payloads(
+                    "Nom\tAge\nAda\t25",
+                    None,
+                    &[
+                        String::from("text/plain"),
+                        String::from("text/rtf"),
+                        String::from("text/tab-separated-values"),
+                    ],
+                    &[
+                        ClipboardFormatPayload::new("text/rtf", rtf.clone()),
+                        ClipboardFormatPayload::new("text/tab-separated-values", tsv.clone()),
+                    ],
+                )
+                .expect("saving multiformat text");
+
+            item_id = item.id;
+
+            assert_eq!(item.classification, ClipboardClassification::Table);
+            assert_eq!(item.classification_subtype.as_deref(), Some("TSV"));
+        }
+
+        {
+            let storage = ClipboardStorage::open(&database_path).expect("reopening database");
+
+            let payloads = storage
+                .load_format_payloads(item_id)
+                .expect("loading payloads");
+
+            assert!(
+                payloads
+                    .iter()
+                    .any(|payload| { payload.mime_type == "text/rtf" && payload.data == rtf })
+            );
+
+            assert!(payloads.iter().any(|payload| {
+                payload.mime_type == "text/tab-separated-values" && payload.data == tsv
+            }));
+        }
+
+        fs::remove_dir_all(directory).expect("removing directory");
+    }
+
+    #[test]
+    fn payload_variants_create_distinct_items() {
+        let directory = create_test_directory("cliph-payload-variant-test");
+        let database_path = directory.join("cliph.db");
+
+        {
+            let storage = ClipboardStorage::open(&database_path).expect("opening database");
+
+            storage
+                .save_text_with_payloads(
+                    "Bonjour",
+                    None,
+                    &[String::from("text/plain"), String::from("text/rtf")],
+                    &[ClipboardFormatPayload::new(
+                        "text/rtf",
+                        br"{\rtf1 Bonjour}".to_vec(),
+                    )],
+                )
+                .expect("saving first RTF");
+
+            storage
+                .save_text_with_payloads(
+                    "Bonjour",
+                    None,
+                    &[String::from("text/plain"), String::from("text/rtf")],
+                    &[ClipboardFormatPayload::new(
+                        "text/rtf",
+                        br"{\rtf1\b Bonjour}".to_vec(),
+                    )],
+                )
+                .expect("saving second RTF");
+
+            assert_eq!(storage.count().expect("counting items"), 2);
         }
 
         fs::remove_dir_all(directory).expect("removing directory");
