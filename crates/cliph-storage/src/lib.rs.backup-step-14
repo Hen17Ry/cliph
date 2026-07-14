@@ -11,14 +11,12 @@ use directories::ProjectDirs;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-const CURRENT_SCHEMA_VERSION: i64 = 2;
-
+const CURRENT_SCHEMA_VERSION: i64 = 1;
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
-
-const RICH_TEXT_MIGRATION: &str = include_str!("../migrations/0002_rich_text.sql");
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
+/// Erreurs pouvant survenir pendant l'accès à l'historique.
 #[derive(Debug)]
 pub enum StorageError {
     ProjectDirectoryUnavailable,
@@ -38,23 +36,16 @@ impl Display for StorageError {
                     "le répertoire de données de l'utilisateur est indisponible"
                 )
             }
-
-            Self::Io(error) => {
-                write!(formatter, "erreur d'accès au disque : {error}")
-            }
-
+            Self::Io(error) => write!(formatter, "erreur d'accès au disque : {error}"),
             Self::Database(error) => {
                 write!(formatter, "erreur de base de données : {error}")
             }
-
             Self::SystemTime(error) => {
                 write!(formatter, "erreur liée à l'horloge système : {error}")
             }
-
             Self::TimestampOverflow => {
                 write!(formatter, "la date système dépasse la capacité de stockage")
             }
-
             Self::UnsupportedSchemaVersion(version) => {
                 write!(
                     formatter,
@@ -98,13 +89,12 @@ impl ClipboardStorage {
             .ok_or(StorageError::ProjectDirectoryUnavailable)?;
 
         let data_directory = project_dirs.data_dir();
-
         fs::create_dir_all(data_directory)?;
 
         Self::open(data_directory.join("cliph.db"))
     }
 
-    /// Ouvre une base précise.
+    /// Ouvre une base précise. Cette méthode facilite également les tests.
     pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
         let database_path = path.as_ref().to_path_buf();
 
@@ -138,22 +128,9 @@ impl ClipboardStorage {
         &self.database_path
     }
 
-    /// Enregistre un texte simple.
-    pub fn save_text(&self, plain_text: &str) -> StorageResult<ClipboardItem> {
-        self.save_rich_text(plain_text, None)
-    }
-
-    /// Enregistre un texte simple accompagné, si disponible,
-    /// de sa représentation HTML.
-    pub fn save_rich_text(
-        &self,
-        plain_text: &str,
-        html_text: Option<&str>,
-    ) -> StorageResult<ClipboardItem> {
-        let normalized_html = html_text.filter(|html| !html.trim().is_empty());
-
-        let content_hash = calculate_content_hash(plain_text, normalized_html);
-
+    /// Enregistre un texte ou le replace en tête s'il existe déjà.
+    pub fn save_text(&self, text: &str) -> StorageResult<ClipboardItem> {
+        let content_hash = calculate_text_hash(text);
         let now = current_timestamp_ns()?;
 
         self.connection.execute(
@@ -161,25 +138,22 @@ impl ClipboardStorage {
             INSERT INTO clipboard_items (
                 kind,
                 plain_text,
-                html_text,
                 content_hash,
                 created_at_ns,
                 last_used_at_ns,
                 is_pinned
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0)
+            VALUES (?1, ?2, ?3, ?4, ?4, 0)
 
             ON CONFLICT(content_hash) DO UPDATE SET
                 plain_text = excluded.plain_text,
-                html_text = excluded.html_text,
                 last_used_at_ns = excluded.last_used_at_ns
             ",
             params![
                 ClipboardItemKind::Text.as_database_value(),
-                plain_text,
-                normalized_html,
+                text,
                 content_hash,
-                now,
+                now
             ],
         )?;
 
@@ -193,20 +167,19 @@ impl ClipboardStorage {
 
         let mut statement = self.connection.prepare(
             "
-                SELECT
-                    id,
-                    plain_text,
-                    html_text,
-                    created_at_ns,
-                    last_used_at_ns,
-                    is_pinned
-                FROM clipboard_items
-                ORDER BY
-                    is_pinned DESC,
-                    last_used_at_ns DESC,
-                    id DESC
-                LIMIT ?1
-                ",
+            SELECT
+                id,
+                plain_text,
+                created_at_ns,
+                last_used_at_ns,
+                is_pinned
+            FROM clipboard_items
+            ORDER BY
+                is_pinned DESC,
+                last_used_at_ns DESC,
+                id DESC
+            LIMIT ?1
+            ",
         )?;
 
         let items = statement
@@ -225,20 +198,15 @@ impl ClipboardStorage {
         Ok(usize::try_from(count).unwrap_or(usize::MAX))
     }
 
-    /// Supprime un élément précis.
+    /// Supprime un élément précis de l'historique.
     pub fn delete_item(&self, item_id: i64) -> StorageResult<bool> {
-        let deleted_count = self.connection.execute(
-            "
-                DELETE FROM clipboard_items
-                WHERE id = ?1
-                ",
-            [item_id],
-        )?;
+        let deleted_count = self
+            .connection
+            .execute("DELETE FROM clipboard_items WHERE id = ?1", [item_id])?;
 
         Ok(deleted_count > 0)
     }
 
-    /// Supprime tout l'historique.
     pub fn clear_history(&self) -> StorageResult<usize> {
         let deleted_count = self.connection.execute("DELETE FROM clipboard_items", [])?;
 
@@ -253,7 +221,6 @@ impl ClipboardStorage {
                 SELECT
                     id,
                     plain_text,
-                    html_text,
                     created_at_ns,
                     last_used_at_ns,
                     is_pinned
@@ -269,44 +236,30 @@ impl ClipboardStorage {
     }
 
     fn run_migrations(&self) -> StorageResult<()> {
-        let mut schema_version: i64 =
-            self.connection
-                .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let schema_version: i64 = self
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
-        if schema_version > CURRENT_SCHEMA_VERSION {
-            return Err(StorageError::UnsupportedSchemaVersion(schema_version));
+        match schema_version {
+            0 => {
+                self.connection.execute_batch(INITIAL_MIGRATION)?;
+                Ok(())
+            }
+            CURRENT_SCHEMA_VERSION => Ok(()),
+            version => Err(StorageError::UnsupportedSchemaVersion(version)),
         }
-
-        if schema_version == 0 {
-            self.connection.execute_batch(INITIAL_MIGRATION)?;
-
-            schema_version = 1;
-        }
-
-        if schema_version == 1 {
-            self.connection.execute_batch(RICH_TEXT_MIGRATION)?;
-
-            schema_version = 2;
-        }
-
-        if schema_version != CURRENT_SCHEMA_VERSION {
-            return Err(StorageError::UnsupportedSchemaVersion(schema_version));
-        }
-
-        Ok(())
     }
 }
 
 fn map_clipboard_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipboardItem> {
-    let is_pinned: i64 = row.get(5)?;
+    let is_pinned: i64 = row.get(4)?;
 
     Ok(ClipboardItem {
         id: row.get(0)?,
         kind: ClipboardItemKind::Text,
         plain_text: row.get(1)?,
-        html_text: row.get(2)?,
-        created_at_ns: row.get(3)?,
-        last_used_at_ns: row.get(4)?,
+        created_at_ns: row.get(2)?,
+        last_used_at_ns: row.get(3)?,
         is_pinned: is_pinned != 0,
     })
 }
@@ -317,20 +270,13 @@ fn current_timestamp_ns() -> StorageResult<i64> {
     i64::try_from(duration.as_nanos()).map_err(|_| StorageError::TimestampOverflow)
 }
 
-fn calculate_content_hash(plain_text: &str, html_text: Option<&str>) -> String {
+fn calculate_text_hash(text: &str) -> String {
     let mut hasher = Sha256::new();
 
-    /*
-     * Ce préfixe reste identique à l'ancienne version
-     * pour préserver les empreintes des textes simples.
-     */
+    // Le préfixe évitera plus tard qu'un texte et un autre type de contenu
+    // produisent la même identité logique.
     hasher.update(b"text\0");
-    hasher.update(plain_text.as_bytes());
-
-    if let Some(html_text) = html_text {
-        hasher.update(b"\0html\0");
-        hasher.update(html_text.as_bytes());
-    }
+    hasher.update(text.as_bytes());
 
     let digest = hasher.finalize();
 
@@ -340,24 +286,19 @@ fn calculate_content_hash(plain_text: &str, html_text: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
     use std::process;
     use std::thread;
     use std::time::Duration;
 
     use super::*;
 
-    fn create_test_directory(prefix: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}",
-            process::id(),
-            current_timestamp_ns().expect("timestamp")
-        ))
-    }
-
     #[test]
     fn text_history_is_persistent_and_deduplicated() {
-        let test_directory = create_test_directory("cliph-storage-test");
+        let test_directory = std::env::temp_dir().join(format!(
+            "cliph-storage-test-{}-{}",
+            process::id(),
+            current_timestamp_ns().expect("timestamp")
+        ));
 
         let database_path = test_directory.join("cliph-test.db");
 
@@ -378,81 +319,48 @@ mod tests {
 
             storage
                 .save_text("Premier texte")
-                .expect("moving text to top");
+                .expect("moving existing text to the top");
 
             assert_eq!(storage.count().expect("counting items"), 2);
-        }
-
-        {
-            let storage = ClipboardStorage::open(&database_path).expect("reopening database");
 
             let items = storage.list_recent(10).expect("listing items");
 
             assert_eq!(items.len(), 2);
-
             assert_eq!(items[0].plain_text, "Premier texte");
-
             assert_eq!(items[1].plain_text, "Deuxième texte");
-
-            assert!(items[0].html_text.is_none());
         }
 
         fs::remove_dir_all(test_directory).expect("removing test directory");
     }
 
     #[test]
-    fn rich_text_html_is_preserved() {
-        let test_directory = create_test_directory("cliph-rich-text-test");
+    fn history_can_be_cleared() {
+        let test_directory = std::env::temp_dir().join(format!(
+            "cliph-clear-test-{}-{}",
+            process::id(),
+            current_timestamp_ns().expect("timestamp")
+        ));
 
-        let database_path = test_directory.join("rich-text.db");
-
-        let html = concat!("<p>", "<strong>Bonjour</strong> ", "<em>ClipH</em>", "</p>");
-
-        {
-            let storage = ClipboardStorage::open(&database_path).expect("opening database");
-
-            let item = storage
-                .save_rich_text("Bonjour ClipH", Some(html))
-                .expect("saving rich text");
-
-            assert_eq!(item.plain_text, "Bonjour ClipH");
-
-            assert_eq!(item.html_text.as_deref(), Some(html));
-
-            assert!(item.has_rich_text());
-        }
+        let database_path = test_directory.join("cliph-clear-test.db");
 
         {
-            let storage = ClipboardStorage::open(&database_path).expect("reopening database");
-
-            let items = storage.list_recent(10).expect("listing rich text");
-
-            assert_eq!(items.len(), 1);
-
-            assert_eq!(items[0].html_text.as_deref(), Some(html));
-        }
-
-        fs::remove_dir_all(test_directory).expect("removing test directory");
-    }
-
-    #[test]
-    fn different_formatting_creates_distinct_items() {
-        let test_directory = create_test_directory("cliph-format-variants-test");
-
-        let database_path = test_directory.join("variants.db");
-
-        {
-            let storage = ClipboardStorage::open(&database_path).expect("opening database");
+            let storage = ClipboardStorage::open(&database_path).expect("opening test database");
 
             storage
-                .save_rich_text("Bonjour", Some("<strong>Bonjour</strong>"))
-                .expect("saving bold text");
+                .save_text("Premier élément")
+                .expect("saving first item");
 
             storage
-                .save_rich_text("Bonjour", Some("<em>Bonjour</em>"))
-                .expect("saving italic text");
+                .save_text("Deuxième élément")
+                .expect("saving second item");
 
-            assert_eq!(storage.count().expect("counting variants"), 2);
+            assert_eq!(storage.count().expect("counting before clear"), 2);
+
+            let deleted_count = storage.clear_history().expect("clearing history");
+
+            assert_eq!(deleted_count, 2);
+            assert_eq!(storage.count().expect("counting after clear"), 0);
+            assert!(storage.list_recent(10).expect("listing history").is_empty());
         }
 
         fs::remove_dir_all(test_directory).expect("removing test directory");
@@ -460,12 +368,16 @@ mod tests {
 
     #[test]
     fn individual_item_can_be_deleted() {
-        let test_directory = create_test_directory("cliph-delete-item-test");
+        let test_directory = std::env::temp_dir().join(format!(
+            "cliph-delete-item-test-{}-{}",
+            process::id(),
+            current_timestamp_ns().expect("timestamp")
+        ));
 
-        let database_path = test_directory.join("delete.db");
+        let database_path = test_directory.join("cliph-delete-item-test.db");
 
         {
-            let storage = ClipboardStorage::open(&database_path).expect("opening database");
+            let storage = ClipboardStorage::open(&database_path).expect("opening test database");
 
             let first_item = storage
                 .save_text("Premier élément")
@@ -475,43 +387,26 @@ mod tests {
                 .save_text("Deuxième élément")
                 .expect("saving second item");
 
-            assert!(storage.delete_item(first_item.id).expect("deleting item"));
+            assert_eq!(storage.count().expect("counting items"), 2);
 
-            let items = storage.list_recent(10).expect("listing items");
+            let was_deleted = storage
+                .delete_item(first_item.id)
+                .expect("deleting first item");
 
-            assert_eq!(items.len(), 1);
-            assert_eq!(items[0].id, second_item.id);
+            assert!(was_deleted);
+            assert_eq!(storage.count().expect("counting remaining items"), 1);
 
-            assert!(
-                !storage
-                    .delete_item(first_item.id)
-                    .expect("deleting missing item")
-            );
-        }
+            let remaining_items = storage.list_recent(10).expect("listing items");
 
-        fs::remove_dir_all(test_directory).expect("removing test directory");
-    }
+            assert_eq!(remaining_items.len(), 1);
+            assert_eq!(remaining_items[0].id, second_item.id);
+            assert_eq!(remaining_items[0].plain_text, "Deuxième élément");
 
-    #[test]
-    fn history_can_be_cleared() {
-        let test_directory = create_test_directory("cliph-clear-test");
+            let deleted_again = storage
+                .delete_item(first_item.id)
+                .expect("deleting missing item");
 
-        let database_path = test_directory.join("clear.db");
-
-        {
-            let storage = ClipboardStorage::open(&database_path).expect("opening database");
-
-            storage
-                .save_text("Premier élément")
-                .expect("saving first item");
-
-            storage
-                .save_text("Deuxième élément")
-                .expect("saving second item");
-
-            assert_eq!(storage.clear_history().expect("clearing history"), 2);
-
-            assert_eq!(storage.count().expect("counting items"), 0);
+            assert!(!deleted_again);
         }
 
         fs::remove_dir_all(test_directory).expect("removing test directory");

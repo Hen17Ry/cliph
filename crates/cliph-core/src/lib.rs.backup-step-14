@@ -20,23 +20,8 @@ impl ClipboardItemKind {
 pub struct ClipboardItem {
     pub id: i64,
     pub kind: ClipboardItemKind,
-
-    /// Représentation textuelle toujours disponible.
     pub plain_text: String,
-
-    /// Représentation HTML facultative conservant le formatage.
-    pub html_text: Option<String>,
-
     pub created_at_ns: i64,
     pub last_used_at_ns: i64,
     pub is_pinned: bool,
-}
-
-impl ClipboardItem {
-    /// Indique si cet élément possède une version HTML enrichie.
-    pub fn has_rich_text(&self) -> bool {
-        self.html_text
-            .as_deref()
-            .is_some_and(|html| !html.trim().is_empty())
-    }
 }
