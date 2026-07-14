@@ -1,11 +1,13 @@
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use adw::prelude::*;
 use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
 use cliph_core::{
-    ClipboardClassification, ClipboardFormatPayload, ClipboardItem, ClipboardItemKind,
+    ClipboardClassification, ClipboardFormatPayload, ClipboardItem, ClipboardItemKind, FilePayload,
+    FileTransferOperation,
 };
 use cliph_storage::{ClipboardStorage, MAX_FORMAT_PAYLOAD_BYTES, MAX_IMAGE_BYTES};
 use futures_util::StreamExt;
@@ -24,6 +26,8 @@ const HTML_MIME_TYPES: &[&str] = &[
 const RTF_MIME_TYPES: &[&str] = &["text/rtf", "application/rtf", "application/x-rtf"];
 const TSV_MIME_TYPES: &[&str] = &["text/tab-separated-values"];
 const CSV_MIME_TYPES: &[&str] = &["text/csv", "application/csv"];
+const GNOME_COPIED_FILES_MIME_TYPES: &[&str] = &["x-special/gnome-copied-files"];
+const URI_LIST_MIME_TYPES: &[&str] = &["text/uri-list"];
 
 #[derive(Debug, Clone)]
 enum DisplayedPayload {
@@ -34,6 +38,9 @@ enum DisplayedPayload {
     },
     Image {
         path: Option<PathBuf>,
+    },
+    Files {
+        files: Vec<FilePayload>,
     },
 }
 
@@ -60,10 +67,8 @@ impl DisplayedItem {
                     DisplayedPayload::Image { path: None }
                 }
             }
-            ClipboardItemKind::Files => DisplayedPayload::Text {
-                plain_text: item.plain_text.clone(),
-                html_text: None,
-                format_payloads,
+            ClipboardItemKind::Files => DisplayedPayload::Files {
+                files: item.files.clone(),
             },
         };
 
@@ -80,6 +85,7 @@ enum PublishedKind {
     RichText,
     MultiFormat,
     Image,
+    Files,
 }
 
 impl PublishedKind {
@@ -89,13 +95,14 @@ impl PublishedKind {
             Self::RichText => "Texte enrichi copié — formatage conservé",
             Self::MultiFormat => "Contenu copié — tous les formats disponibles sont restaurés",
             Self::Image => "Image copiée — utilisez Ctrl + V pour la coller",
+            Self::Files => "Fichiers copiés — collez-les dans un dossier avec Ctrl + V",
         }
     }
 }
 
 type DisplayedHistory = Rc<RefCell<Vec<DisplayedItem>>>;
 
-struct TextCaptureContext {
+struct ClipboardCaptureContext {
     storage: Rc<ClipboardStorage>,
     history_list: gtk::ListBox,
     empty_state: gtk::Label,
@@ -190,6 +197,65 @@ fn publish_item_to_clipboard(
             clipboard.set_texture(&texture);
 
             Ok(PublishedKind::Image)
+        }
+        DisplayedPayload::Files { files } => {
+            let available_uris = files
+                .iter()
+                .filter(|file| file.exists_now() != Some(false))
+                .map(|file| file.uri.clone())
+                .collect::<Vec<_>>();
+
+            if available_uris.is_empty() {
+                return Err(String::from(
+                    "aucun des fichiers locaux enregistrés n’existe encore",
+                ));
+            }
+
+            /*
+             * Nautilus sous GTK 4 utilise la représentation native
+             * GdkFileList. Les formats MIME restent publiés pour les
+             * autres applications et pour la compatibilité GNOME.
+             */
+            let gio_files = available_uris
+                .iter()
+                .map(|uri| gio::File::for_uri(uri))
+                .collect::<Vec<_>>();
+
+            let file_list = gdk::FileList::from_array(&gio_files);
+            let file_list_value = file_list.to_value();
+
+            let uri_list = format!(
+                "{}
+",
+                available_uris.join(
+                    "
+"
+                )
+            );
+
+            /*
+             * On restaure volontairement une opération de copie,
+             * même lorsque la sélection avait été coupée à l’origine.
+             */
+            let gnome_copied_files = format!("copy\n{}", available_uris.join("\n"));
+
+            let uri_list_bytes = glib::Bytes::from_owned(uri_list.into_bytes());
+
+            let gnome_bytes = glib::Bytes::from_owned(gnome_copied_files.into_bytes());
+
+            let providers = [
+                gdk::ContentProvider::for_value(&file_list_value),
+                gdk::ContentProvider::for_bytes("text/uri-list", &uri_list_bytes),
+                gdk::ContentProvider::for_bytes("x-special/gnome-copied-files", &gnome_bytes),
+            ];
+
+            let provider = gdk::ContentProvider::new_union(&providers);
+
+            clipboard
+                .set_content(Some(&provider))
+                .map_err(|error| error.to_string())?;
+
+            Ok(PublishedKind::Files)
         }
     }
 }
@@ -361,6 +427,111 @@ fn create_image_content(item: &ClipboardItem) -> gtk::Box {
     container
 }
 
+fn create_files_content(item: &ClipboardItem) -> gtk::Box {
+    let container = gtk::Box::new(Orientation::Horizontal, 14);
+    container.set_hexpand(true);
+
+    let icon_name =
+        if item.files.len() == 1 && item.files.first().is_some_and(|file| file.is_directory) {
+            "folder-symbolic"
+        } else {
+            "text-x-generic-symbolic"
+        };
+
+    let icon = gtk::Image::from_icon_name(icon_name);
+    icon.set_pixel_size(48);
+    icon.set_valign(Align::Center);
+    icon.set_can_target(false);
+
+    let details = gtk::Box::new(Orientation::Vertical, 6);
+    details.set_hexpand(true);
+    details.set_valign(Align::Center);
+
+    let type_text = match item.classification_subtype.as_deref() {
+        Some(subtype) => format!("FICHIERS • {subtype}"),
+        None => String::from("FICHIERS"),
+    };
+
+    let type_label = gtk::Label::new(Some(&type_text));
+    type_label.set_halign(Align::Start);
+    type_label.add_css_class("caption");
+    type_label.add_css_class("dim-label");
+    type_label.set_can_target(false);
+
+    let visible_names = item
+        .files
+        .iter()
+        .take(3)
+        .map(|file| file.display_name.as_str())
+        .collect::<Vec<_>>();
+
+    let mut title_text = visible_names.join("\n");
+
+    if item.files.len() > visible_names.len() {
+        let remaining = item.files.len() - visible_names.len();
+        title_text.push_str(&format!("\n+ {remaining} autre(s)"));
+    }
+
+    if title_text.is_empty() {
+        title_text.push_str("Sélection de fichiers indisponible");
+    }
+
+    let title = gtk::Label::new(Some(&title_text));
+    title.set_halign(Align::Start);
+    title.set_xalign(0.0);
+    title.set_wrap(true);
+    title.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    title.set_lines(5);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title.add_css_class("heading");
+    title.set_can_target(false);
+
+    let known_size = item
+        .files
+        .iter()
+        .filter_map(|file| file.byte_size)
+        .sum::<u64>();
+
+    let missing_count = item
+        .files
+        .iter()
+        .filter(|file| file.exists_now() == Some(false))
+        .count();
+
+    let operation = match item.file_transfer_operation {
+        Some(FileTransferOperation::Cut) => "coupé à l’origine",
+        Some(FileTransferOperation::Copy) | None => "copié",
+    };
+
+    let mut metadata_parts = vec![operation.to_owned()];
+
+    if known_size > 0 {
+        metadata_parts.push(format_byte_size(known_size));
+    }
+
+    if missing_count > 0 {
+        metadata_parts.push(format!("{missing_count} introuvable(s)"));
+    } else {
+        metadata_parts.push(String::from("disponible"));
+    }
+
+    let metadata_label = gtk::Label::new(Some(&metadata_parts.join(" • ")));
+    metadata_label.set_halign(Align::Start);
+    metadata_label.set_xalign(0.0);
+    metadata_label.set_wrap(true);
+    metadata_label.add_css_class("caption");
+    metadata_label.add_css_class("dim-label");
+    metadata_label.set_can_target(false);
+
+    details.append(&type_label);
+    details.append(&title);
+    details.append(&metadata_label);
+
+    container.append(&icon);
+    container.append(&details);
+    container
+}
+
 fn create_history_row(
     item: &ClipboardItem,
     storage: Rc<ClipboardStorage>,
@@ -378,8 +549,9 @@ fn create_history_row(
     ));
 
     let item_content = match item.kind {
-        ClipboardItemKind::Text | ClipboardItemKind::Files => create_text_content(item),
+        ClipboardItemKind::Text => create_text_content(item),
         ClipboardItemKind::Image => create_image_content(item),
+        ClipboardItemKind::Files => create_files_content(item),
     };
 
     let copy_icon = gtk::Image::from_icon_name("edit-copy-symbolic");
@@ -462,7 +634,9 @@ fn update_history_status(total_count: usize, empty_state: &gtk::Label, counter_l
     };
 
     counter_label.set_text(&counter_text);
-    empty_state.set_label("L’historique est vide.\n\nCopiez un texte ou une image avec Ctrl + C.");
+    empty_state.set_label(
+        "L’historique est vide.\n\nCopiez un texte, une image ou un fichier avec Ctrl + C.",
+    );
     empty_state.set_visible(total_count == 0);
 }
 
@@ -659,6 +833,210 @@ fn html_text_from_payloads(payloads: &[ClipboardFormatPayload]) -> Option<String
     (!html_text.trim().is_empty()).then_some(html_text)
 }
 
+fn is_file_like_uri(uri: &str) -> bool {
+    let lowercase = uri.to_ascii_lowercase();
+
+    [
+        "file://",
+        "smb://",
+        "sftp://",
+        "ftp://",
+        "dav://",
+        "davs://",
+        "mtp://",
+        "gphoto2://",
+        "trash://",
+        "recent://",
+    ]
+    .iter()
+    .any(|scheme| lowercase.starts_with(scheme))
+}
+
+fn parse_file_transfer_payload(
+    payload: &ClipboardFormatPayload,
+) -> Option<(FileTransferOperation, Vec<String>)> {
+    let text = String::from_utf8_lossy(&payload.data);
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+
+    let mut operation = FileTransferOperation::Copy;
+    let mut uris = Vec::new();
+
+    if payload.mime_type == "x-special/gnome-copied-files"
+        && let Some(first_line) = lines.next()
+    {
+        operation = if first_line.eq_ignore_ascii_case("cut") {
+            FileTransferOperation::Cut
+        } else {
+            FileTransferOperation::Copy
+        };
+
+        // Garde ici tout le reste du contenu actuel.
+    }
+
+    uris.extend(
+        lines
+            .filter(|line| is_file_like_uri(line))
+            .map(str::to_owned),
+    );
+
+    let mut unique_uris = Vec::new();
+
+    for uri in uris {
+        if !unique_uris.contains(&uri) {
+            unique_uris.push(uri);
+        }
+    }
+
+    (!unique_uris.is_empty()).then_some((operation, unique_uris))
+}
+
+fn mime_type_from_path(path: &Path, is_directory: bool) -> Option<String> {
+    if is_directory {
+        return Some(String::from("inode/directory"));
+    }
+
+    let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
+
+    let mime_type = match extension.as_str() {
+        "pdf" => "application/pdf",
+        "txt" | "log" | "md" => "text/plain",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "rtf" => "text/rtf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "7z" => "application/x-7z-compressed",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "mp4" => "video/mp4",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
+    };
+
+    Some(mime_type.to_owned())
+}
+
+fn file_payload_from_uri(uri: &str) -> FilePayload {
+    let file = gio::File::for_uri(uri);
+    let path = file.path();
+    let metadata = path.as_deref().and_then(|path| fs::metadata(path).ok());
+
+    let is_directory = metadata.as_ref().is_some_and(std::fs::Metadata::is_dir);
+
+    let byte_size = metadata
+        .as_ref()
+        .filter(|metadata| metadata.is_file())
+        .map(std::fs::Metadata::len);
+
+    let display_name = path
+        .as_deref()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| uri.to_owned());
+
+    let mime_type = path
+        .as_deref()
+        .and_then(|path| mime_type_from_path(path, is_directory));
+
+    FilePayload {
+        uri: uri.to_owned(),
+        path,
+        display_name,
+        mime_type,
+        byte_size,
+        is_directory,
+        existed_at_capture: metadata.is_some(),
+    }
+}
+
+async fn read_file_transfer_payload(
+    clipboard: &gdk::Clipboard,
+    available_mime_types: &[String],
+) -> Option<ClipboardFormatPayload> {
+    if let Some(payload) = read_format_payload(
+        clipboard,
+        available_mime_types,
+        GNOME_COPIED_FILES_MIME_TYPES,
+        "x-special/gnome-copied-files",
+    )
+    .await
+    {
+        return Some(payload);
+    }
+
+    read_format_payload(
+        clipboard,
+        available_mime_types,
+        URI_LIST_MIME_TYPES,
+        "text/uri-list",
+    )
+    .await
+}
+
+fn capture_file_content(
+    clipboard: gdk::Clipboard,
+    context: ClipboardCaptureContext,
+    available_mime_types: Vec<String>,
+) {
+    glib::MainContext::default().spawn_local(async move {
+        let Some(payload) = read_file_transfer_payload(&clipboard, &available_mime_types).await
+        else {
+            capture_text_content(clipboard, context, available_mime_types);
+            return;
+        };
+
+        let Some((operation, uris)) = parse_file_transfer_payload(&payload) else {
+            capture_text_content(clipboard, context, available_mime_types);
+            return;
+        };
+
+        let files = uris
+            .iter()
+            .map(|uri| file_payload_from_uri(uri))
+            .collect::<Vec<_>>();
+
+        match context
+            .storage
+            .save_files(operation, &files, &available_mime_types)
+        {
+            Ok(_) => {
+                refresh_history(
+                    &context.storage,
+                    &context.history_list,
+                    &context.empty_state,
+                    &context.counter_label,
+                    &context.displayed_history,
+                    &context.toast_overlay,
+                );
+            }
+            Err(error) => {
+                eprintln!("Impossible d’enregistrer les fichiers copiés : {error}");
+                show_toast(
+                    &context.toast_overlay,
+                    "Impossible d’enregistrer cette sélection de fichiers",
+                );
+            }
+        }
+    });
+}
+
 fn capture_image_content(
     clipboard: gdk::Clipboard,
     storage: Rc<ClipboardStorage>,
@@ -712,7 +1090,7 @@ fn capture_image_content(
 
 fn capture_text_content(
     clipboard: gdk::Clipboard,
-    context: TextCaptureContext,
+    context: ClipboardCaptureContext,
     available_mime_types: Vec<String>,
 ) {
     glib::MainContext::default().spawn_local(async move {
@@ -779,6 +1157,26 @@ fn capture_clipboard_content(
         .map(|mime_type| mime_type.as_str().to_owned())
         .collect::<Vec<_>>();
 
+    let contains_files =
+        clipboard_has_any_mime_type(&available_mime_types, GNOME_COPIED_FILES_MIME_TYPES)
+            || clipboard_has_any_mime_type(&available_mime_types, URI_LIST_MIME_TYPES);
+
+    if contains_files {
+        capture_file_content(
+            clipboard.clone(),
+            ClipboardCaptureContext {
+                storage,
+                history_list,
+                empty_state,
+                counter_label,
+                displayed_history,
+                toast_overlay,
+            },
+            available_mime_types,
+        );
+        return;
+    }
+
     let contains_image = formats.contains_type(gdk::Texture::static_type())
         || mime_types
             .iter()
@@ -813,7 +1211,7 @@ fn capture_clipboard_content(
     if contains_text {
         capture_text_content(
             clipboard.clone(),
-            TextCaptureContext {
+            ClipboardCaptureContext {
                 storage,
                 history_list,
                 empty_state,
@@ -966,7 +1364,7 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     title.add_css_class("title-2");
 
     let description = gtk::Label::new(Some(
-        "Cliquez sur un texte ou une image pour le remettre dans le presse-papiers.",
+        "Cliquez sur un texte, une image ou des fichiers pour les remettre dans le presse-papiers.",
     ));
     description.set_halign(Align::Start);
     description.set_xalign(0.0);
@@ -984,7 +1382,7 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     introduction.append(&counter_label);
 
     let empty_state = gtk::Label::new(Some(
-        "L’historique est vide.\n\nCopiez un texte ou une image avec Ctrl + C.",
+        "L’historique est vide.\n\nCopiez un texte, une image ou un fichier avec Ctrl + C.",
     ));
     empty_state.set_halign(Align::Center);
     empty_state.set_valign(Align::Center);

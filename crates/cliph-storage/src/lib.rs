@@ -7,14 +7,14 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 
 use cliph_core::{
-    ClipboardClassification, ClipboardFormatPayload, ClipboardItem, ClipboardItemKind,
-    ImagePayload, classify_text,
+    ClipboardClassification, ClipboardFormatPayload, ClipboardItem, ClipboardItemKind, FilePayload,
+    FileTransferOperation, ImagePayload, classify_text,
 };
 use directories::ProjectDirs;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
 const RICH_TEXT_MIGRATION: &str = include_str!("../migrations/0002_rich_text.sql");
@@ -22,6 +22,7 @@ const IMAGE_HISTORY_MIGRATION: &str = include_str!("../migrations/0003_image_his
 const CLASSIFICATION_MIGRATION: &str =
     include_str!("../migrations/0004_classification_metadata.sql");
 const MULTIFORMAT_MIGRATION: &str = include_str!("../migrations/0005_multiformat_payloads.sql");
+const FILE_HISTORY_MIGRATION: &str = include_str!("../migrations/0006_file_history.sql");
 
 /// Limite de sécurité actuelle : 25 Mio par image.
 pub const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
@@ -65,6 +66,10 @@ pub enum StorageError {
         maximum: usize,
     },
     InvalidStoredFormatByteSize(i64),
+    EmptyFileList,
+    UnknownFileTransferOperation(String),
+    InvalidStoredFileByteSize(i64),
+    FilePositionOverflow(usize),
 }
 
 impl Display for StorageError {
@@ -126,6 +131,21 @@ impl Display for StorageError {
             Self::InvalidStoredFormatByteSize(size) => write!(
                 formatter,
                 "taille de représentation MIME invalide dans la base : {size}"
+            ),
+            Self::EmptyFileList => {
+                write!(formatter, "aucun fichier n'a été fourni")
+            }
+            Self::UnknownFileTransferOperation(operation) => write!(
+                formatter,
+                "opération de transfert de fichiers inconnue : {operation}"
+            ),
+            Self::InvalidStoredFileByteSize(size) => write!(
+                formatter,
+                "taille de fichier invalide dans la base : {size}"
+            ),
+            Self::FilePositionOverflow(position) => write!(
+                formatter,
+                "la position de fichier {position} dépasse la capacité de stockage"
             ),
         }
     }
@@ -328,6 +348,95 @@ impl ClipboardStorage {
             .ok_or(rusqlite::Error::QueryReturnedNoRows.into())
     }
 
+    /// Enregistre une sélection de fichiers ou de dossiers sans dupliquer
+    /// leur contenu sur le disque.
+    pub fn save_files(
+        &self,
+        operation: FileTransferOperation,
+        files: &[FilePayload],
+        mime_types: &[String],
+    ) -> StorageResult<ClipboardItem> {
+        let normalized_files = normalize_file_payloads(files);
+
+        if normalized_files.is_empty() {
+            return Err(StorageError::EmptyFileList);
+        }
+
+        let content_hash = calculate_files_hash(&normalized_files);
+        let now = current_timestamp_ns()?;
+        let plain_text = normalized_files
+            .iter()
+            .map(|file| file.display_name.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let subtype = if normalized_files.len() == 1 {
+            if normalized_files[0].is_directory {
+                String::from("Dossier")
+            } else {
+                String::from("Fichier")
+            }
+        } else {
+            format!("{} éléments", normalized_files.len())
+        };
+
+        self.connection.execute(
+            "
+            INSERT INTO clipboard_items (
+                kind,
+                plain_text,
+                html_text,
+                content_hash,
+                created_at_ns,
+                last_used_at_ns,
+                is_pinned,
+                classification,
+                classification_subtype,
+                classification_confidence
+            )
+            VALUES (?1, ?2, NULL, ?3, ?4, ?4, 0, 'files', ?5, 100)
+
+            ON CONFLICT(content_hash) DO UPDATE SET
+                plain_text = excluded.plain_text,
+                last_used_at_ns = excluded.last_used_at_ns,
+                classification = excluded.classification,
+                classification_subtype = excluded.classification_subtype,
+                classification_confidence = excluded.classification_confidence
+            ",
+            params![
+                ClipboardItemKind::Files.as_database_value(),
+                plain_text,
+                content_hash,
+                now,
+                subtype,
+            ],
+        )?;
+
+        let item_id = self.item_id_by_hash(&content_hash)?;
+        self.replace_file_collection(item_id, operation, &normalized_files)?;
+
+        let mut normalized_mime_types = mime_types
+            .iter()
+            .map(|mime_type| mime_type.trim().to_ascii_lowercase())
+            .filter(|mime_type| !mime_type.is_empty())
+            .collect::<Vec<_>>();
+
+        if !normalized_mime_types
+            .iter()
+            .any(|mime_type| mime_type == "text/uri-list")
+        {
+            normalized_mime_types.push(String::from("text/uri-list"));
+        }
+
+        normalized_mime_types.sort();
+        normalized_mime_types.dedup();
+
+        self.merge_item_mime_types(item_id, &normalized_mime_types)?;
+
+        self.find_by_hash(&content_hash)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows.into())
+    }
+
     /// Enregistre une image déjà encodée au format PNG.
     pub fn save_image_png(
         &self,
@@ -472,9 +581,18 @@ impl ClipboardStorage {
 
         let data_directory = self.data_directory.clone();
 
-        let items = statement
+        let mut items = statement
             .query_map([limit], move |row| map_clipboard_item(row, &data_directory))?
             .collect::<Result<Vec<_>, _>>()?;
+
+        for item in &mut items {
+            if item.kind == ClipboardItemKind::Files {
+                let (operation, files) = self.load_file_collection(item.id)?;
+
+                item.file_transfer_operation = Some(operation);
+                item.files = files;
+            }
+        }
 
         Ok(items)
     }
@@ -606,6 +724,153 @@ impl ClipboardStorage {
         Ok(())
     }
 
+    fn replace_file_collection(
+        &self,
+        item_id: i64,
+        operation: FileTransferOperation,
+        files: &[FilePayload],
+    ) -> StorageResult<()> {
+        self.connection.execute(
+            "
+            DELETE FROM file_entries
+            WHERE item_id = ?1
+            ",
+            [item_id],
+        )?;
+
+        self.connection.execute(
+            "
+            DELETE FROM file_collections
+            WHERE item_id = ?1
+            ",
+            [item_id],
+        )?;
+
+        self.connection.execute(
+            "
+            INSERT INTO file_collections (
+                item_id,
+                operation
+            )
+            VALUES (?1, ?2)
+            ",
+            params![item_id, operation.as_database_value()],
+        )?;
+
+        for (position, file) in files.iter().enumerate() {
+            let position = i64::try_from(position)
+                .map_err(|_| StorageError::FilePositionOverflow(position))?;
+
+            let byte_size = file
+                .byte_size
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| StorageError::InvalidStoredFileByteSize(i64::MAX))?;
+
+            let local_path = file
+                .path
+                .as_deref()
+                .map(|path| path.to_string_lossy().into_owned());
+
+            self.connection.execute(
+                "
+                INSERT INTO file_entries (
+                    item_id,
+                    position,
+                    uri,
+                    local_path,
+                    display_name,
+                    mime_type,
+                    byte_size,
+                    is_directory,
+                    existed_at_capture
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ",
+                params![
+                    item_id,
+                    position,
+                    &file.uri,
+                    local_path,
+                    &file.display_name,
+                    file.mime_type.as_deref(),
+                    byte_size,
+                    i64::from(file.is_directory),
+                    i64::from(file.existed_at_capture),
+                ],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Charge la sélection de fichiers associée à un élément.
+    pub fn load_file_collection(
+        &self,
+        item_id: i64,
+    ) -> StorageResult<(FileTransferOperation, Vec<FilePayload>)> {
+        let operation_value: String = self.connection.query_row(
+            "
+            SELECT operation
+            FROM file_collections
+            WHERE item_id = ?1
+            ",
+            [item_id],
+            |row| row.get(0),
+        )?;
+
+        let operation = FileTransferOperation::from_database_value(&operation_value)
+            .ok_or_else(|| StorageError::UnknownFileTransferOperation(operation_value))?;
+
+        let mut statement = self.connection.prepare(
+            "
+            SELECT
+                uri,
+                local_path,
+                display_name,
+                mime_type,
+                byte_size,
+                is_directory,
+                existed_at_capture
+            FROM file_entries
+            WHERE item_id = ?1
+            ORDER BY position ASC
+            ",
+        )?;
+
+        let files = statement
+            .query_map([item_id], |row| {
+                let stored_byte_size: Option<i64> = row.get(4)?;
+
+                let byte_size = stored_byte_size
+                    .map(|size| {
+                        u64::try_from(size).map_err(|_| {
+                            conversion_error(
+                                4,
+                                rusqlite::types::Type::Integer,
+                                StorageError::InvalidStoredFileByteSize(size).to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?;
+
+                let local_path: Option<String> = row.get(1)?;
+
+                Ok(FilePayload {
+                    uri: row.get(0)?,
+                    path: local_path.map(PathBuf::from),
+                    display_name: row.get(2)?,
+                    mime_type: row.get(3)?,
+                    byte_size,
+                    is_directory: row.get::<_, i64>(5)? != 0,
+                    existed_at_capture: row.get::<_, i64>(6)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok((operation, files))
+    }
+
     /// Charge les représentations binaires nécessaires à une restauration fidèle.
     pub fn load_format_payloads(&self, item_id: i64) -> StorageResult<Vec<ClipboardFormatPayload>> {
         let mut statement = self.connection.prepare(
@@ -659,7 +924,7 @@ impl ClipboardStorage {
     fn find_by_hash(&self, content_hash: &str) -> StorageResult<Option<ClipboardItem>> {
         let data_directory = self.data_directory.clone();
 
-        let item = self
+        let mut item = self
             .connection
             .query_row(
                 "
@@ -698,6 +963,15 @@ impl ClipboardStorage {
             )
             .optional()?;
 
+        if let Some(item) = item.as_mut()
+            && item.kind == ClipboardItemKind::Files
+        {
+            let (operation, files) = self.load_file_collection(item.id)?;
+
+            item.file_transfer_operation = Some(operation);
+            item.files = files;
+        }
+
         Ok(item)
     }
 
@@ -733,6 +1007,11 @@ impl ClipboardStorage {
         if schema_version == 4 {
             self.connection.execute_batch(MULTIFORMAT_MIGRATION)?;
             schema_version = 5;
+        }
+
+        if schema_version == 5 {
+            self.connection.execute_batch(FILE_HISTORY_MIGRATION)?;
+            schema_version = 6;
         }
 
         if schema_version != CURRENT_SCHEMA_VERSION {
@@ -828,6 +1107,8 @@ fn map_clipboard_item(
         plain_text: row.get(2)?,
         html_text: row.get(3)?,
         image,
+        file_transfer_operation: None,
+        files: Vec::new(),
         created_at_ns: row.get(4)?,
         last_used_at_ns: row.get(5)?,
         is_pinned: is_pinned != 0,
@@ -965,6 +1246,68 @@ fn is_persisted_text_payload_mime(mime_type: &str) -> bool {
         mime_type,
         "text/html" | "text/rtf" | "text/tab-separated-values" | "text/csv"
     )
+}
+
+fn normalize_file_payloads(files: &[FilePayload]) -> Vec<FilePayload> {
+    let mut normalized = Vec::new();
+
+    for file in files {
+        let uri = file.uri.trim();
+
+        if uri.is_empty()
+            || normalized
+                .iter()
+                .any(|existing: &FilePayload| existing.uri == uri)
+        {
+            continue;
+        }
+
+        let display_name = if file.display_name.trim().is_empty() {
+            file.path
+                .as_deref()
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| uri.to_owned())
+        } else {
+            file.display_name.trim().to_owned()
+        };
+
+        normalized.push(FilePayload {
+            uri: uri.to_owned(),
+            path: file.path.clone(),
+            display_name,
+            mime_type: file
+                .mime_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|mime_type| !mime_type.is_empty())
+                .map(str::to_ascii_lowercase),
+            byte_size: file.byte_size,
+            is_directory: file.is_directory,
+            existed_at_capture: file.existed_at_capture,
+        });
+    }
+
+    normalized
+}
+
+fn calculate_files_hash(files: &[FilePayload]) -> String {
+    let mut uris = files
+        .iter()
+        .map(|file| file.uri.as_str())
+        .collect::<Vec<_>>();
+
+    uris.sort_unstable();
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"files\0");
+
+    for uri in uris {
+        hasher.update(uri.as_bytes());
+        hasher.update(b"\0");
+    }
+
+    format_digest(hasher.finalize())
 }
 
 fn current_timestamp_ns() -> StorageResult<i64> {
@@ -1345,6 +1688,112 @@ mod tests {
                 .expect("saving second RTF");
 
             assert_eq!(storage.count().expect("counting items"), 2);
+        }
+
+        fs::remove_dir_all(directory).expect("removing directory");
+    }
+
+    #[test]
+    fn file_references_are_persistent_and_deduplicated() {
+        let directory = create_test_directory("cliph-file-history-test");
+        let database_path = directory.join("cliph.db");
+
+        let first_path = directory.join("rapport.pdf");
+        let second_path = directory.join("documents");
+
+        fs::create_dir_all(&second_path).expect("creating directory");
+        fs::write(&first_path, b"PDF test").expect("creating file");
+
+        let files = vec![
+            FilePayload {
+                uri: String::from("file:///tmp/rapport.pdf"),
+                path: Some(first_path.clone()),
+                display_name: String::from("rapport.pdf"),
+                mime_type: Some(String::from("application/pdf")),
+                byte_size: Some(8),
+                is_directory: false,
+                existed_at_capture: true,
+            },
+            FilePayload {
+                uri: String::from("file:///tmp/documents"),
+                path: Some(second_path.clone()),
+                display_name: String::from("documents"),
+                mime_type: Some(String::from("inode/directory")),
+                byte_size: None,
+                is_directory: true,
+                existed_at_capture: true,
+            },
+        ];
+
+        let item_id;
+
+        {
+            let storage = ClipboardStorage::open(&database_path).expect("opening database");
+
+            let first = storage
+                .save_files(
+                    FileTransferOperation::Copy,
+                    &files,
+                    &[String::from("text/uri-list")],
+                )
+                .expect("saving files");
+
+            let second = storage
+                .save_files(
+                    FileTransferOperation::Copy,
+                    &files,
+                    &[String::from("text/uri-list")],
+                )
+                .expect("saving duplicate files");
+
+            assert_eq!(first.id, second.id);
+            assert_eq!(storage.count().expect("counting items"), 1);
+            assert_eq!(second.classification, ClipboardClassification::Files);
+            assert_eq!(
+                second.file_transfer_operation,
+                Some(FileTransferOperation::Copy)
+            );
+            assert_eq!(second.files.len(), 2);
+
+            item_id = second.id;
+        }
+
+        {
+            let storage = ClipboardStorage::open(&database_path).expect("reopening database");
+
+            let (operation, restored_files) = storage
+                .load_file_collection(item_id)
+                .expect("loading file collection");
+
+            assert_eq!(operation, FileTransferOperation::Copy);
+            assert_eq!(restored_files.len(), 2);
+            assert_eq!(restored_files[0].display_name, "rapport.pdf");
+            assert!(restored_files[1].is_directory);
+
+            let recent = storage.list_recent(10).expect("listing items");
+            assert_eq!(recent[0].files.len(), 2);
+        }
+
+        fs::remove_dir_all(directory).expect("removing directory");
+    }
+
+    #[test]
+    fn empty_file_list_is_rejected() {
+        let directory = create_test_directory("cliph-empty-file-history-test");
+        let database_path = directory.join("cliph.db");
+
+        {
+            let storage = ClipboardStorage::open(&database_path).expect("opening database");
+
+            let error = storage
+                .save_files(
+                    FileTransferOperation::Copy,
+                    &[],
+                    &[String::from("text/uri-list")],
+                )
+                .expect_err("empty list must fail");
+
+            assert!(matches!(error, StorageError::EmptyFileList));
         }
 
         fs::remove_dir_all(directory).expect("removing directory");

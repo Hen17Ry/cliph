@@ -1,6 +1,6 @@
 //! Modèles métier partagés par les composants de ClipH.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub mod classifier;
 
@@ -23,6 +23,75 @@ impl ClipboardFormatPayload {
 
     pub fn byte_size(&self) -> usize {
         self.data.len()
+    }
+}
+
+/// Action initiale associée à une sélection de fichiers.
+///
+/// ClipH conserve cette information pour représenter fidèlement ce qui a été
+/// copié. L'interface pourra toutefois restaurer un ancien élément en mode
+/// copie afin d'éviter un déplacement involontaire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTransferOperation {
+    Copy,
+    Cut,
+}
+
+impl FileTransferOperation {
+    pub const fn as_database_value(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Cut => "cut",
+        }
+    }
+
+    pub fn from_database_value(value: &str) -> Option<Self> {
+        match value {
+            "copy" => Some(Self::Copy),
+            "cut" => Some(Self::Cut),
+            _ => None,
+        }
+    }
+}
+
+/// Référence vers un fichier ou un dossier copié.
+///
+/// ClipH ne duplique pas le contenu du fichier : il conserve son URI et ses
+/// métadonnées. Le chemin peut donc devenir indisponible après un déplacement
+/// ou une suppression externe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePayload {
+    pub uri: String,
+    pub path: Option<PathBuf>,
+    pub display_name: String,
+    pub mime_type: Option<String>,
+    pub byte_size: Option<u64>,
+    pub is_directory: bool,
+    pub existed_at_capture: bool,
+}
+
+impl FilePayload {
+    pub fn new(
+        uri: impl Into<String>,
+        path: Option<PathBuf>,
+        display_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            uri: uri.into(),
+            path,
+            display_name: display_name.into(),
+            mime_type: None,
+            byte_size: None,
+            is_directory: false,
+            existed_at_capture: true,
+        }
+    }
+
+    /// Indique si la cible locale existe encore.
+    ///
+    /// Pour une URI non locale, l'information n'est pas vérifiable ici.
+    pub fn exists_now(&self) -> Option<bool> {
+        self.path.as_deref().map(Path::exists)
     }
 }
 
@@ -87,7 +156,7 @@ pub struct ClipboardItem {
     /// Représentations MIME connues pour cet élément.
     pub mime_types: Vec<String>,
 
-    /// Texte simple. Cette chaîne est vide pour une image.
+    /// Texte simple. Pour un groupe de fichiers, il contient leurs noms.
     pub plain_text: String,
 
     /// Représentation HTML facultative.
@@ -95,6 +164,12 @@ pub struct ClipboardItem {
 
     /// Informations de l'image lorsque `kind == Image`.
     pub image: Option<ImagePayload>,
+
+    /// Action associée aux fichiers lorsque `kind == Files`.
+    pub file_transfer_operation: Option<FileTransferOperation>,
+
+    /// Fichiers et dossiers lorsque `kind == Files`.
+    pub files: Vec<FilePayload>,
 
     pub created_at_ns: i64,
     pub last_used_at_ns: i64,
