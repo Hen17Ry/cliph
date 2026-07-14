@@ -1,21 +1,20 @@
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use adw::prelude::*;
 use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
-use cliph_core::ClipboardItem;
-use cliph_storage::ClipboardStorage;
+use cliph_core::{ClipboardItem, ClipboardItemKind};
+use cliph_storage::{ClipboardStorage, MAX_IMAGE_BYTES};
 use futures_util::StreamExt;
+use gtk::glib::types::StaticType;
 use gtk::{Align, Orientation, gdk, gio, glib};
 
 const APP_ID: &str = "com.cliph.ClipH";
 const DISPLAYED_HISTORY_LIMIT: usize = 200;
-
 const GLOBAL_SHORTCUT_ID: &str = "toggle-cliph";
 const GLOBAL_SHORTCUT_TRIGGER: &str = "LOGO+h";
-
 const MAX_RICH_TEXT_BYTES: usize = 4 * 1024 * 1024;
-
 const HTML_MIME_TYPES: &[&str] = &[
     "text/html",
     "text/html;charset=utf-8",
@@ -23,17 +22,61 @@ const HTML_MIME_TYPES: &[&str] = &[
 ];
 
 #[derive(Debug, Clone)]
+enum DisplayedPayload {
+    Text {
+        plain_text: String,
+        html_text: Option<String>,
+    },
+    Image {
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone)]
 struct DisplayedItem {
     id: i64,
-    plain_text: String,
-    html_text: Option<String>,
+    payload: DisplayedPayload,
 }
 
 impl DisplayedItem {
-    fn has_rich_text(&self) -> bool {
-        self.html_text
-            .as_deref()
-            .is_some_and(|html| !html.trim().is_empty())
+    fn from_item(item: &ClipboardItem) -> Self {
+        let payload = match item.kind {
+            ClipboardItemKind::Text => DisplayedPayload::Text {
+                plain_text: item.plain_text.clone(),
+                html_text: item.html_text.clone(),
+            },
+            ClipboardItemKind::Image => {
+                if let Some(image) = &item.image {
+                    DisplayedPayload::Image {
+                        path: Some(image.path.clone()),
+                    }
+                } else {
+                    DisplayedPayload::Image { path: None }
+                }
+            }
+        };
+
+        Self {
+            id: item.id,
+            payload,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PublishedKind {
+    PlainText,
+    RichText,
+    Image,
+}
+
+impl PublishedKind {
+    const fn success_message(self) -> &'static str {
+        match self {
+            Self::PlainText => "Élément copié — utilisez Ctrl + V pour le coller",
+            Self::RichText => "Texte enrichi copié — formatage conservé",
+            Self::Image => "Image copiée — utilisez Ctrl + V pour la coller",
+        }
     }
 }
 
@@ -45,78 +88,62 @@ fn show_toast(toast_overlay: &adw::ToastOverlay, message: &str) {
     toast_overlay.add_toast(toast);
 }
 
-fn clear_history_list(history_list: &gtk::ListBox) {
-    while let Some(child) = history_list.first_child() {
-        history_list.remove(&child);
+fn format_byte_size(byte_size: u64) -> String {
+    const KIBIBYTE: f64 = 1024.0;
+    const MEBIBYTE: f64 = 1024.0 * 1024.0;
+
+    if byte_size < 1024 {
+        format!("{byte_size} o")
+    } else if byte_size < 1024 * 1024 {
+        format!("{:.1} Kio", byte_size as f64 / KIBIBYTE)
+    } else {
+        format!("{:.1} Mio", byte_size as f64 / MEBIBYTE)
     }
-}
-
-fn update_history_status(total_count: usize, empty_state: &gtk::Label, counter_label: &gtk::Label) {
-    let counter_text = match total_count {
-        0 => String::from("0 élément"),
-        1 => String::from("1 élément enregistré"),
-        count => format!("{count} éléments enregistrés"),
-    };
-
-    counter_label.set_text(&counter_text);
-
-    empty_state.set_label("L’historique est vide.\n\nCopiez un texte avec Ctrl + C.");
-
-    empty_state.set_visible(total_count == 0);
 }
 
 fn publish_item_to_clipboard(
     clipboard: &gdk::Clipboard,
     item: &DisplayedItem,
-) -> Result<(), glib::BoolError> {
-    let Some(html_text) = item
-        .html_text
-        .as_deref()
-        .filter(|html| !html.trim().is_empty())
-    else {
-        clipboard.set_text(&item.plain_text);
-        return Ok(());
-    };
+) -> Result<PublishedKind, String> {
+    match &item.payload {
+        DisplayedPayload::Text {
+            plain_text,
+            html_text,
+        } => {
+            let Some(html_text) = html_text.as_deref().filter(|html| !html.trim().is_empty())
+            else {
+                clipboard.set_text(plain_text);
+                return Ok(PublishedKind::PlainText);
+            };
 
-    /*
-     * La valeur Rust String permet à GDK de publier les formats
-     * textuels standards, notamment text/plain.
-     */
-    let plain_value = item.plain_text.to_value();
+            let plain_value = plain_text.to_value();
+            let plain_provider = gdk::ContentProvider::for_value(&plain_value);
+            let html_bytes = glib::Bytes::from_owned(html_text.as_bytes().to_vec());
+            let html_provider = gdk::ContentProvider::for_bytes("text/html", &html_bytes);
+            let provider = gdk::ContentProvider::new_union(&[html_provider, plain_provider]);
 
-    let plain_provider = gdk::ContentProvider::for_value(&plain_value);
+            clipboard
+                .set_content(Some(&provider))
+                .map_err(|error| error.to_string())?;
 
-    /*
-     * La représentation HTML est publiée explicitement comme
-     * text/html afin que les logiciels compatibles conservent
-     * le gras, l'italique, les liens, les listes, etc.
-     */
-    let html_bytes = glib::Bytes::from_owned(html_text.as_bytes().to_vec());
+            Ok(PublishedKind::RichText)
+        }
+        DisplayedPayload::Image { path, .. } => {
+            let path = path
+                .as_ref()
+                .ok_or_else(|| String::from("le fichier de l’image est indisponible"))?;
 
-    let html_provider = gdk::ContentProvider::for_bytes("text/html", &html_bytes);
+            let file = gio::File::for_path(path);
+            let texture = gdk::Texture::from_file(&file).map_err(|error| error.to_string())?;
 
-    let combined_provider = gdk::ContentProvider::new_union(&[html_provider, plain_provider]);
+            clipboard.set_texture(&texture);
 
-    clipboard.set_content(Some(&combined_provider))
+            Ok(PublishedKind::Image)
+        }
+    }
 }
 
-fn create_history_row(
-    item: &ClipboardItem,
-    storage: Rc<ClipboardStorage>,
-    history_list: gtk::ListBox,
-    empty_state: gtk::Label,
-    counter_label: gtk::Label,
-    displayed_history: DisplayedHistory,
-    toast_overlay: adw::ToastOverlay,
-) -> gtk::ListBoxRow {
-    let row = gtk::ListBoxRow::new();
-
-    row.set_activatable(true);
-    row.set_selectable(false);
-    row.set_tooltip_text(Some(
-        "Cliquer sur la ligne pour remettre cet élément dans le presse-papiers",
-    ));
-
+fn create_text_content(item: &ClipboardItem) -> gtk::Box {
     let type_text = if item.has_rich_text() {
         "TEXTE ENRICHI"
     } else {
@@ -140,7 +167,6 @@ fn create_history_row(
     preview.set_can_target(false);
 
     let character_count = item.plain_text.chars().count();
-
     let character_description = match character_count {
         1 => String::from("1 caractère"),
         count => format!("{count} caractères"),
@@ -153,51 +179,146 @@ fn create_history_row(
     };
 
     let metadata_label = gtk::Label::new(Some(&metadata));
-
     metadata_label.set_halign(Align::Start);
     metadata_label.add_css_class("caption");
     metadata_label.add_css_class("dim-label");
     metadata_label.set_can_target(false);
 
-    let text_content = gtk::Box::new(Orientation::Vertical, 6);
+    let content = gtk::Box::new(Orientation::Vertical, 6);
+    content.set_hexpand(true);
+    content.append(&type_label);
+    content.append(&preview);
+    content.append(&metadata_label);
 
-    text_content.set_hexpand(true);
-    text_content.append(&type_label);
-    text_content.append(&preview);
-    text_content.append(&metadata_label);
+    content
+}
+
+fn create_image_content(item: &ClipboardItem) -> gtk::Box {
+    let container = gtk::Box::new(Orientation::Horizontal, 14);
+    container.set_hexpand(true);
+
+    let details = gtk::Box::new(Orientation::Vertical, 6);
+    details.set_hexpand(true);
+    details.set_valign(Align::Center);
+
+    let type_label = gtk::Label::new(Some("IMAGE"));
+    type_label.set_halign(Align::Start);
+    type_label.add_css_class("caption");
+    type_label.add_css_class("dim-label");
+    type_label.set_can_target(false);
+
+    details.append(&type_label);
+
+    if let Some(image) = &item.image {
+        let picture = gtk::Picture::for_filename(&image.path);
+        picture.set_size_request(170, 110);
+        picture.set_can_shrink(true);
+        picture.set_halign(Align::Start);
+        picture.set_valign(Align::Center);
+        picture.set_alternative_text(Some("Aperçu de l’image copiée"));
+        picture.set_can_target(false);
+
+        let title = gtk::Label::new(Some("Image copiée"));
+        title.set_halign(Align::Start);
+        title.set_xalign(0.0);
+        title.add_css_class("heading");
+        title.set_can_target(false);
+
+        let metadata = format!(
+            "{} × {} • {} • PNG",
+            image.width,
+            image.height,
+            format_byte_size(image.byte_size),
+        );
+
+        let metadata_label = gtk::Label::new(Some(&metadata));
+        metadata_label.set_halign(Align::Start);
+        metadata_label.set_xalign(0.0);
+        metadata_label.set_wrap(true);
+        metadata_label.add_css_class("caption");
+        metadata_label.add_css_class("dim-label");
+        metadata_label.set_can_target(false);
+
+        details.append(&title);
+        details.append(&metadata_label);
+        container.append(&picture);
+    } else {
+        let missing_icon = gtk::Image::from_icon_name("image-missing-symbolic");
+        missing_icon.set_pixel_size(64);
+        missing_icon.set_can_target(false);
+
+        let title = gtk::Label::new(Some("Image indisponible"));
+        title.set_halign(Align::Start);
+        title.add_css_class("heading");
+        title.set_can_target(false);
+
+        let metadata_label = gtk::Label::new(Some(
+            "Le fichier associé à cette image n’a pas pu être retrouvé.",
+        ));
+        metadata_label.set_halign(Align::Start);
+        metadata_label.set_xalign(0.0);
+        metadata_label.set_wrap(true);
+        metadata_label.add_css_class("caption");
+        metadata_label.add_css_class("dim-label");
+        metadata_label.set_can_target(false);
+
+        details.append(&title);
+        details.append(&metadata_label);
+        container.append(&missing_icon);
+    }
+
+    container.append(&details);
+    container
+}
+
+fn create_history_row(
+    item: &ClipboardItem,
+    storage: Rc<ClipboardStorage>,
+    history_list: gtk::ListBox,
+    empty_state: gtk::Label,
+    counter_label: gtk::Label,
+    displayed_history: DisplayedHistory,
+    toast_overlay: adw::ToastOverlay,
+) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
+    row.set_activatable(true);
+    row.set_selectable(false);
+    row.set_tooltip_text(Some(
+        "Cliquer sur la ligne pour remettre cet élément dans le presse-papiers",
+    ));
+
+    let item_content = match item.kind {
+        ClipboardItemKind::Text => create_text_content(item),
+        ClipboardItemKind::Image => create_image_content(item),
+    };
 
     let copy_icon = gtk::Image::from_icon_name("edit-copy-symbolic");
-
     copy_icon.set_valign(Align::Center);
     copy_icon.add_css_class("dim-label");
     copy_icon.set_can_target(false);
 
     let delete_button = gtk::Button::from_icon_name("edit-delete-symbolic");
-
     delete_button.set_tooltip_text(Some("Supprimer cet élément de l’historique"));
     delete_button.add_css_class("flat");
     delete_button.set_valign(Align::Center);
     delete_button.set_focus_on_click(false);
 
     let actions = gtk::Box::new(Orientation::Horizontal, 6);
-
     actions.set_valign(Align::Center);
     actions.append(&copy_icon);
     actions.append(&delete_button);
 
     let row_content = gtk::Box::new(Orientation::Horizontal, 12);
-
     row_content.set_margin_top(12);
     row_content.set_margin_bottom(12);
     row_content.set_margin_start(14);
     row_content.set_margin_end(14);
-    row_content.append(&text_content);
+    row_content.append(&item_content);
     row_content.append(&actions);
 
     row.set_child(Some(&row_content));
 
     let item_id = item.id;
-
     let storage_for_delete = storage;
     let history_list_for_delete = history_list;
     let row_for_delete = row.clone();
@@ -209,17 +330,14 @@ fn create_history_row(
     delete_button.connect_clicked(move |_| match storage_for_delete.delete_item(item_id) {
         Ok(true) => {
             history_list_for_delete.remove(&row_for_delete);
-
             displayed_for_delete
                 .borrow_mut()
                 .retain(|displayed_item| displayed_item.id != item_id);
 
             let total_count = match storage_for_delete.count() {
                 Ok(count) => count,
-
                 Err(error) => {
                     eprintln!("Impossible de compter les éléments après suppression : {error}");
-
                     displayed_for_delete.borrow().len()
                 }
             };
@@ -228,19 +346,34 @@ fn create_history_row(
 
             show_toast(&toast_for_delete, "Élément supprimé de l’historique");
         }
-
         Ok(false) => {
             show_toast(&toast_for_delete, "Cet élément a déjà été supprimé");
         }
-
         Err(error) => {
             eprintln!("Impossible de supprimer l’élément {item_id} : {error}");
-
             show_toast(&toast_for_delete, "Impossible de supprimer cet élément");
         }
     });
 
     row
+}
+
+fn clear_history_list(history_list: &gtk::ListBox) {
+    while let Some(child) = history_list.first_child() {
+        history_list.remove(&child);
+    }
+}
+
+fn update_history_status(total_count: usize, empty_state: &gtk::Label, counter_label: &gtk::Label) {
+    let counter_text = match total_count {
+        0 => String::from("0 élément"),
+        1 => String::from("1 élément enregistré"),
+        count => format!("{count} éléments enregistrés"),
+    };
+
+    counter_label.set_text(&counter_text);
+    empty_state.set_label("L’historique est vide.\n\nCopiez un texte ou une image avec Ctrl + C.");
+    empty_state.set_visible(total_count == 0);
 }
 
 fn refresh_history(
@@ -257,14 +390,8 @@ fn refresh_history(
 
             {
                 let mut displayed_items = displayed_history.borrow_mut();
-
                 displayed_items.clear();
-
-                displayed_items.extend(items.iter().map(|item| DisplayedItem {
-                    id: item.id,
-                    plain_text: item.plain_text.clone(),
-                    html_text: item.html_text.clone(),
-                }));
+                displayed_items.extend(items.iter().map(DisplayedItem::from_item));
             }
 
             for item in &items {
@@ -282,20 +409,14 @@ fn refresh_history(
             }
 
             let total_count = storage.count().unwrap_or(items.len());
-
             update_history_status(total_count, empty_state, counter_label);
         }
-
         Err(error) => {
             eprintln!("Impossible de charger l’historique : {error}");
-
             clear_history_list(history_list);
             displayed_history.borrow_mut().clear();
-
             counter_label.set_text("Erreur de chargement");
-
             empty_state.set_label("ClipH n’a pas pu charger l’historique.\nConsultez le terminal.");
-
             empty_state.set_visible(true);
         }
     }
@@ -317,10 +438,8 @@ async fn read_html_from_clipboard(clipboard: &gdk::Clipboard) -> Option<String> 
         .await
     {
         Ok(result) => result,
-
         Err(error) => {
             eprintln!("Impossible de lire le format HTML : {error}");
-
             return None;
         }
     };
@@ -332,10 +451,8 @@ async fn read_html_from_clipboard(clipboard: &gdk::Clipboard) -> Option<String> 
         .await
     {
         Ok(result) => result,
-
         Err((_buffer, error)) => {
             eprintln!("Impossible de lire les données HTML : {error}");
-
             return None;
         }
     };
@@ -359,8 +476,8 @@ async fn read_html_from_clipboard(clipboard: &gdk::Clipboard) -> Option<String> 
     }
 }
 
-fn capture_clipboard_content(
-    clipboard: &gdk::Clipboard,
+fn capture_image_content(
+    clipboard: gdk::Clipboard,
     storage: Rc<ClipboardStorage>,
     history_list: gtk::ListBox,
     empty_state: gtk::Label,
@@ -368,35 +485,62 @@ fn capture_clipboard_content(
     displayed_history: DisplayedHistory,
     toast_overlay: adw::ToastOverlay,
 ) {
-    let contains_textual_content = clipboard.formats().mime_types().iter().any(|mime_type| {
-        let mime_type = mime_type.as_str();
+    glib::MainContext::default().spawn_local(async move {
+        let texture = match clipboard.read_texture_future().await {
+            Ok(Some(texture)) => texture,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("Impossible de lire l’image du presse-papiers : {error}");
+                return;
+            }
+        };
 
-        mime_type.starts_with("text/plain")
-            || mime_type.starts_with("text/html")
-            || matches!(mime_type, "UTF8_STRING" | "STRING" | "TEXT")
+        let width = texture.width();
+        let height = texture.height();
+        let png_bytes = texture.save_to_png_bytes();
+        let png_slice = png_bytes.as_ref();
+
+        if png_slice.len() > MAX_IMAGE_BYTES {
+            show_toast(
+                &toast_overlay,
+                "Image ignorée : sa taille dépasse la limite de 25 Mio",
+            );
+            return;
+        }
+
+        match storage.save_image_png(png_slice, width, height) {
+            Ok(_) => {
+                refresh_history(
+                    &storage,
+                    &history_list,
+                    &empty_state,
+                    &counter_label,
+                    &displayed_history,
+                    &toast_overlay,
+                );
+            }
+            Err(error) => {
+                eprintln!("Impossible d’enregistrer l’image : {error}");
+                show_toast(&toast_overlay, "Impossible d’enregistrer cette image");
+            }
+        }
     });
+}
 
-    if !contains_textual_content {
-        return;
-    }
-
-    let clipboard = clipboard.clone();
-
+fn capture_text_content(
+    clipboard: gdk::Clipboard,
+    storage: Rc<ClipboardStorage>,
+    history_list: gtk::ListBox,
+    empty_state: gtk::Label,
+    counter_label: gtk::Label,
+    displayed_history: DisplayedHistory,
+    toast_overlay: adw::ToastOverlay,
+) {
     glib::MainContext::default().spawn_local(async move {
         let plain_text = match clipboard.read_text_future().await {
             Ok(Some(text)) => text.to_string(),
-
-            Ok(None) => {
-                return;
-            }
-
-            Err(_) => {
-                /*
-                 * Le presse-papiers peut changer entre
-                 * le signal et la lecture.
-                 */
-                return;
-            }
+            Ok(None) => return,
+            Err(_) => return,
         };
 
         if plain_text.trim().is_empty() {
@@ -416,7 +560,6 @@ fn capture_clipboard_content(
                     &toast_overlay,
                 );
             }
-
             Err(error) => {
                 eprintln!("Impossible d’enregistrer le contenu du presse-papiers : {error}");
             }
@@ -424,9 +567,62 @@ fn capture_clipboard_content(
     });
 }
 
+fn capture_clipboard_content(
+    clipboard: &gdk::Clipboard,
+    storage: Rc<ClipboardStorage>,
+    history_list: gtk::ListBox,
+    empty_state: gtk::Label,
+    counter_label: gtk::Label,
+    displayed_history: DisplayedHistory,
+    toast_overlay: adw::ToastOverlay,
+) {
+    if clipboard.is_local() {
+        return;
+    }
+
+    let formats = clipboard.formats();
+    let mime_types = formats.mime_types();
+
+    let contains_image = formats.contains_type(gdk::Texture::static_type())
+        || mime_types
+            .iter()
+            .any(|mime_type| mime_type.as_str().starts_with("image/"));
+
+    if contains_image {
+        capture_image_content(
+            clipboard.clone(),
+            storage,
+            history_list,
+            empty_state,
+            counter_label,
+            displayed_history,
+            toast_overlay,
+        );
+        return;
+    }
+
+    let contains_text = mime_types.iter().any(|mime_type| {
+        let mime_type = mime_type.as_str();
+        mime_type.starts_with("text/plain")
+            || mime_type.starts_with("text/html")
+            || matches!(mime_type, "UTF8_STRING" | "STRING" | "TEXT")
+    });
+
+    if contains_text {
+        capture_text_content(
+            clipboard.clone(),
+            storage,
+            history_list,
+            empty_state,
+            counter_label,
+            displayed_history,
+            toast_overlay,
+        );
+    }
+}
+
 fn show_startup_error(app: &adw::Application, message: &str) {
     let title = gtk::Label::new(Some("ClipH ne peut pas démarrer"));
-
     title.add_css_class("title-2");
 
     let details = gtk::Label::new(Some(message));
@@ -435,7 +631,6 @@ fn show_startup_error(app: &adw::Application, message: &str) {
     details.add_css_class("dim-label");
 
     let content = gtk::Box::new(Orientation::Vertical, 12);
-
     content.set_halign(Align::Center);
     content.set_valign(Align::Center);
     content.set_margin_top(32);
@@ -463,7 +658,6 @@ fn setup_global_shortcut(window: &adw::ApplicationWindow, toast_overlay: &adw::T
     glib::MainContext::default().spawn_local(async move {
         if let Err(error) = run_global_shortcut(window, toast_overlay.clone()).await {
             eprintln!("Impossible d’activer Windows + H : {error}");
-
             show_toast(&toast_overlay, "Impossible d’activer Windows + H");
         }
     });
@@ -495,9 +689,7 @@ async fn run_global_shortcut(
 
     if !shortcut_is_bound {
         eprintln!("Le raccourci Windows + H n’a pas été autorisé.");
-
         show_toast(&toast_overlay, "Windows + H n’a pas été autorisé");
-
         return Ok(());
     }
 
@@ -509,7 +701,6 @@ async fn run_global_shortcut(
         .unwrap_or("Windows + H");
 
     println!("Raccourci global actif : {trigger_description}");
-
     show_toast(&toast_overlay, "Windows + H est maintenant actif");
 
     let mut activations = portal.receive_activated().await?;
@@ -527,19 +718,15 @@ async fn run_global_shortcut(
     }
 
     drop(session);
-
     Ok(())
 }
 
 fn build_ui(app: &adw::Application, start_hidden: bool) {
     let storage = match ClipboardStorage::open_default() {
         Ok(storage) => Rc::new(storage),
-
         Err(error) => {
             eprintln!("Impossible d’initialiser ClipH : {error}");
-
             show_startup_error(app, &error.to_string());
-
             return;
         }
     };
@@ -548,23 +735,21 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
         "Base de données ClipH : {}",
         storage.database_path().display()
     );
+    println!("Images ClipH : {}", storage.images_directory().display());
 
     let displayed_history: DisplayedHistory = Rc::new(RefCell::new(Vec::new()));
 
     let header_title = gtk::Label::new(Some("ClipH"));
-
     header_title.add_css_class("heading");
 
     let header_bar = adw::HeaderBar::new();
     header_bar.set_title_widget(Some(&header_title));
 
     let quit_button = gtk::Button::from_icon_name("application-exit-symbolic");
-
     quit_button.set_tooltip_text(Some("Quitter complètement ClipH"));
     quit_button.add_css_class("flat");
 
     let app_for_quit = app.clone();
-
     quit_button.connect_clicked(move |_| {
         app_for_quit.quit();
     });
@@ -572,35 +757,30 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     header_bar.pack_end(&quit_button);
 
     let title = gtk::Label::new(Some("Historique du presse-papiers"));
-
     title.set_halign(Align::Start);
     title.add_css_class("title-2");
 
     let description = gtk::Label::new(Some(
-        "Cliquez sur un élément pour restaurer son contenu et son formatage.",
+        "Cliquez sur un texte ou une image pour le remettre dans le presse-papiers.",
     ));
-
     description.set_halign(Align::Start);
     description.set_xalign(0.0);
     description.set_wrap(true);
     description.add_css_class("dim-label");
 
     let counter_label = gtk::Label::new(Some("0 élément"));
-
     counter_label.set_halign(Align::Start);
     counter_label.add_css_class("caption");
     counter_label.add_css_class("dim-label");
 
     let introduction = gtk::Box::new(Orientation::Vertical, 6);
-
     introduction.append(&title);
     introduction.append(&description);
     introduction.append(&counter_label);
 
     let empty_state = gtk::Label::new(Some(
-        "L’historique est vide.\n\nCopiez un texte avec Ctrl + C.",
+        "L’historique est vide.\n\nCopiez un texte ou une image avec Ctrl + C.",
     ));
-
     empty_state.set_halign(Align::Center);
     empty_state.set_valign(Align::Center);
     empty_state.set_justify(gtk::Justification::Center);
@@ -609,13 +789,11 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     empty_state.add_css_class("dim-label");
 
     let history_list = gtk::ListBox::new();
-
     history_list.set_selection_mode(gtk::SelectionMode::None);
     history_list.set_activate_on_single_click(true);
     history_list.add_css_class("boxed-list");
 
     let history_container = gtk::Box::new(Orientation::Vertical, 12);
-
     history_container.append(&empty_state);
     history_container.append(&history_list);
 
@@ -627,7 +805,6 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
         .build();
 
     let content = gtk::Box::new(Orientation::Vertical, 18);
-
     content.set_margin_top(24);
     content.set_margin_bottom(24);
     content.set_margin_start(24);
@@ -636,51 +813,44 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     content.append(&scrolled_window);
 
     let page = gtk::Box::new(Orientation::Vertical, 0);
-
     page.append(&header_bar);
     page.append(&content);
 
     let toast_overlay = adw::ToastOverlay::new();
-
     toast_overlay.set_child(Some(&page));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("ClipH")
-        .default_width(620)
-        .default_height(600)
+        .default_width(680)
+        .default_height(680)
         .content(&toast_overlay)
         .build();
 
     window.set_hide_on_close(true);
 
     let clear_menu_button = gtk::MenuButton::new();
-
     clear_menu_button.set_icon_name("edit-delete-symbolic");
     clear_menu_button.set_tooltip_text(Some("Effacer tout l’historique"));
     clear_menu_button.add_css_class("flat");
 
     let confirmation_title = gtk::Label::new(Some("Effacer tout l’historique ?"));
-
     confirmation_title.set_halign(Align::Start);
     confirmation_title.add_css_class("heading");
 
     let confirmation_text = gtk::Label::new(Some(
-        "Tous les éléments enregistrés seront définitivement supprimés.",
+        "Tous les textes, images et fichiers associés seront définitivement supprimés.",
     ));
-
     confirmation_text.set_halign(Align::Start);
     confirmation_text.set_xalign(0.0);
     confirmation_text.set_wrap(true);
-    confirmation_text.set_max_width_chars(32);
+    confirmation_text.set_max_width_chars(34);
     confirmation_text.add_css_class("dim-label");
 
     let confirm_clear_button = gtk::Button::with_label("Tout effacer");
-
     confirm_clear_button.add_css_class("destructive-action");
 
     let confirmation_content = gtk::Box::new(Orientation::Vertical, 12);
-
     confirmation_content.set_margin_top(16);
     confirmation_content.set_margin_bottom(16);
     confirmation_content.set_margin_start(16);
@@ -690,11 +860,8 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     confirmation_content.append(&confirm_clear_button);
 
     let clear_popover = gtk::Popover::new();
-
     clear_popover.set_child(Some(&confirmation_content));
-
     clear_menu_button.set_popover(Some(&clear_popover));
-
     header_bar.pack_end(&clear_menu_button);
 
     let storage_for_clear = storage.clone();
@@ -707,10 +874,7 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
 
     confirm_clear_button.connect_clicked(move |_| {
         match storage_for_clear.clear_history() {
-            Ok(0) => {
-                show_toast(&toast_for_clear, "L’historique est déjà vide");
-            }
-
+            Ok(0) => show_toast(&toast_for_clear, "L’historique est déjà vide"),
             Ok(deleted_count) => {
                 refresh_history(
                     &storage_for_clear,
@@ -723,16 +887,13 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
 
                 let message = match deleted_count {
                     1 => String::from("1 élément supprimé"),
-
                     count => format!("{count} éléments supprimés"),
                 };
 
                 show_toast(&toast_for_clear, &message);
             }
-
             Err(error) => {
                 eprintln!("Impossible d’effacer l’historique : {error}");
-
                 show_toast(&toast_for_clear, "Impossible d’effacer l’historique");
             }
         }
@@ -751,18 +912,14 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
 
     let display =
         gdk::Display::default().expect("ClipH ne peut pas accéder à l’affichage graphique.");
-
     let clipboard = display.clipboard();
 
     let displayed_for_activation = displayed_history.clone();
-
     let clipboard_for_activation = clipboard.clone();
-
     let toast_for_activation = toast_overlay.clone();
 
     history_list.connect_row_activated(move |_, row| {
         let index = row.index();
-
         if index < 0 {
             return;
         }
@@ -774,24 +931,13 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
 
         let Some(selected_item) = selected_item else {
             eprintln!("Élément introuvable pour la ligne {index}");
-
             return;
         };
 
         match publish_item_to_clipboard(&clipboard_for_activation, &selected_item) {
-            Ok(()) => {
-                let message = if selected_item.has_rich_text() {
-                    "Texte enrichi copié — formatage conservé"
-                } else {
-                    "Élément copié — utilisez Ctrl + V pour le coller"
-                };
-
-                show_toast(&toast_for_activation, message);
-            }
-
+            Ok(kind) => show_toast(&toast_for_activation, kind.success_message()),
             Err(error) => {
                 eprintln!("Impossible de restaurer l’élément : {error}");
-
                 show_toast(&toast_for_activation, "Impossible de copier cet élément");
             }
         }

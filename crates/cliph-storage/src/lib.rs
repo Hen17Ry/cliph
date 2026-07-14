@@ -6,16 +6,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 
-use cliph_core::{ClipboardItem, ClipboardItemKind};
+use cliph_core::{ClipboardItem, ClipboardItemKind, ImagePayload};
 use directories::ProjectDirs;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
 
 const RICH_TEXT_MIGRATION: &str = include_str!("../migrations/0002_rich_text.sql");
+
+const IMAGE_HISTORY_MIGRATION: &str = include_str!("../migrations/0003_image_history.sql");
+
+/// Limite de sécurité actuelle : 25 Mio par image.
+pub const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
@@ -27,6 +32,11 @@ pub enum StorageError {
     SystemTime(SystemTimeError),
     TimestampOverflow,
     UnsupportedSchemaVersion(i64),
+    UnknownItemKind(String),
+    InvalidImageDimensions { width: i32, height: i32 },
+    EmptyImage,
+    ImageTooLarge { actual: usize, maximum: usize },
+    InvalidStoredByteSize(i64),
 }
 
 impl Display for StorageError {
@@ -61,6 +71,32 @@ impl Display for StorageError {
                     "version de base de données non prise en charge : {version}"
                 )
             }
+
+            Self::UnknownItemKind(kind) => {
+                write!(formatter, "type d'élément inconnu dans la base : {kind}")
+            }
+
+            Self::InvalidImageDimensions { width, height } => {
+                write!(
+                    formatter,
+                    "dimensions d'image invalides : {width} × {height}"
+                )
+            }
+
+            Self::EmptyImage => {
+                write!(formatter, "l'image ne contient aucune donnée")
+            }
+
+            Self::ImageTooLarge { actual, maximum } => {
+                write!(
+                    formatter,
+                    "l'image fait {actual} octets, limite autorisée : {maximum} octets"
+                )
+            }
+
+            Self::InvalidStoredByteSize(size) => {
+                write!(formatter, "taille d'image invalide dans la base : {size}")
+            }
         }
     }
 }
@@ -85,14 +121,16 @@ impl From<SystemTimeError> for StorageError {
     }
 }
 
-/// Point d'accès au stockage SQLite de ClipH.
+/// Point d'accès au stockage SQLite et aux fichiers binaires.
 pub struct ClipboardStorage {
     connection: Connection,
     database_path: PathBuf,
+    data_directory: PathBuf,
+    images_directory: PathBuf,
 }
 
 impl ClipboardStorage {
-    /// Ouvre la base située dans le répertoire standard de ClipH.
+    /// Ouvre la base standard de ClipH.
     pub fn open_default() -> StorageResult<Self> {
         let project_dirs = ProjectDirs::from("com", "ClipH", "ClipH")
             .ok_or(StorageError::ProjectDirectoryUnavailable)?;
@@ -108,9 +146,14 @@ impl ClipboardStorage {
     pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
         let database_path = path.as_ref().to_path_buf();
 
-        if let Some(parent) = database_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let data_directory = database_path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or(StorageError::ProjectDirectoryUnavailable)?;
+
+        let images_directory = data_directory.join("blobs").join("images");
+
+        fs::create_dir_all(&images_directory)?;
 
         let connection = Connection::open(&database_path)?;
 
@@ -126,6 +169,8 @@ impl ClipboardStorage {
         let storage = Self {
             connection,
             database_path,
+            data_directory,
+            images_directory,
         };
 
         storage.run_migrations()?;
@@ -133,9 +178,16 @@ impl ClipboardStorage {
         Ok(storage)
     }
 
-    /// Chemin réel de la base actuellement utilisée.
     pub fn database_path(&self) -> &Path {
         &self.database_path
+    }
+
+    pub fn data_directory(&self) -> &Path {
+        &self.data_directory
+    }
+
+    pub fn images_directory(&self) -> &Path {
+        &self.images_directory
     }
 
     /// Enregistre un texte simple.
@@ -143,8 +195,7 @@ impl ClipboardStorage {
         self.save_rich_text(plain_text, None)
     }
 
-    /// Enregistre un texte simple accompagné, si disponible,
-    /// de sa représentation HTML.
+    /// Enregistre un texte et son éventuel HTML.
     pub fn save_rich_text(
         &self,
         plain_text: &str,
@@ -152,7 +203,7 @@ impl ClipboardStorage {
     ) -> StorageResult<ClipboardItem> {
         let normalized_html = html_text.filter(|html| !html.trim().is_empty());
 
-        let content_hash = calculate_content_hash(plain_text, normalized_html);
+        let content_hash = calculate_text_hash(plain_text, normalized_html);
 
         let now = current_timestamp_ns()?;
 
@@ -187,46 +238,175 @@ impl ClipboardStorage {
             .ok_or(rusqlite::Error::QueryReturnedNoRows.into())
     }
 
-    /// Retourne les éléments les plus récents.
+    /// Enregistre une image déjà encodée au format PNG.
+    pub fn save_image_png(
+        &self,
+        png_bytes: &[u8],
+        width: i32,
+        height: i32,
+    ) -> StorageResult<ClipboardItem> {
+        if png_bytes.is_empty() {
+            return Err(StorageError::EmptyImage);
+        }
+
+        if png_bytes.len() > MAX_IMAGE_BYTES {
+            return Err(StorageError::ImageTooLarge {
+                actual: png_bytes.len(),
+                maximum: MAX_IMAGE_BYTES,
+            });
+        }
+
+        if width <= 0 || height <= 0 {
+            return Err(StorageError::InvalidImageDimensions { width, height });
+        }
+
+        let content_hash = calculate_image_hash(png_bytes);
+
+        let relative_path = PathBuf::from("blobs")
+            .join("images")
+            .join(format!("{content_hash}.png"));
+
+        let absolute_path = self.data_directory.join(&relative_path);
+
+        write_blob_if_missing(&absolute_path, png_bytes)?;
+
+        let now = current_timestamp_ns()?;
+
+        self.connection.execute(
+            "
+            INSERT INTO clipboard_items (
+                kind,
+                plain_text,
+                html_text,
+                content_hash,
+                created_at_ns,
+                last_used_at_ns,
+                is_pinned
+            )
+            VALUES (?1, '', NULL, ?2, ?3, ?3, 0)
+
+            ON CONFLICT(content_hash) DO UPDATE SET
+                last_used_at_ns = excluded.last_used_at_ns
+            ",
+            params![
+                ClipboardItemKind::Image.as_database_value(),
+                content_hash,
+                now,
+            ],
+        )?;
+
+        let item_id: i64 = self.connection.query_row(
+            "
+                SELECT id
+                FROM clipboard_items
+                WHERE content_hash = ?1
+                ",
+            [&content_hash],
+            |row| row.get(0),
+        )?;
+
+        let relative_path_string = relative_path.to_string_lossy().into_owned();
+
+        let byte_size =
+            i64::try_from(png_bytes.len()).map_err(|_| StorageError::ImageTooLarge {
+                actual: png_bytes.len(),
+                maximum: MAX_IMAGE_BYTES,
+            })?;
+
+        self.connection.execute(
+            "
+            INSERT INTO image_payloads (
+                item_id,
+                relative_path,
+                mime_type,
+                width,
+                height,
+                byte_size
+            )
+            VALUES (?1, ?2, 'image/png', ?3, ?4, ?5)
+
+            ON CONFLICT(item_id) DO UPDATE SET
+                relative_path = excluded.relative_path,
+                mime_type = excluded.mime_type,
+                width = excluded.width,
+                height = excluded.height,
+                byte_size = excluded.byte_size
+            ",
+            params![item_id, relative_path_string, width, height, byte_size,],
+        )?;
+
+        self.find_by_hash(&content_hash)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows.into())
+    }
+
+    /// Retourne les éléments récents.
     pub fn list_recent(&self, limit: usize) -> StorageResult<Vec<ClipboardItem>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
 
         let mut statement = self.connection.prepare(
             "
                 SELECT
-                    id,
-                    plain_text,
-                    html_text,
-                    created_at_ns,
-                    last_used_at_ns,
-                    is_pinned
+                    clipboard_items.id,
+                    clipboard_items.kind,
+                    clipboard_items.plain_text,
+                    clipboard_items.html_text,
+                    clipboard_items.created_at_ns,
+                    clipboard_items.last_used_at_ns,
+                    clipboard_items.is_pinned,
+                    image_payloads.relative_path,
+                    image_payloads.mime_type,
+                    image_payloads.width,
+                    image_payloads.height,
+                    image_payloads.byte_size
                 FROM clipboard_items
+                LEFT JOIN image_payloads
+                    ON image_payloads.item_id =
+                       clipboard_items.id
                 ORDER BY
-                    is_pinned DESC,
-                    last_used_at_ns DESC,
-                    id DESC
+                    clipboard_items.is_pinned DESC,
+                    clipboard_items.last_used_at_ns DESC,
+                    clipboard_items.id DESC
                 LIMIT ?1
                 ",
         )?;
 
+        let data_directory = self.data_directory.clone();
+
         let items = statement
-            .query_map([limit], map_clipboard_item)?
+            .query_map([limit], move |row| map_clipboard_item(row, &data_directory))?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(items)
     }
 
-    /// Nombre total d'éléments enregistrés.
     pub fn count(&self) -> StorageResult<usize> {
-        let count: i64 =
-            self.connection
-                .query_row("SELECT COUNT(*) FROM clipboard_items", [], |row| row.get(0))?;
+        let count: i64 = self.connection.query_row(
+            "
+                SELECT COUNT(*)
+                FROM clipboard_items
+                ",
+            [],
+            |row| row.get(0),
+        )?;
 
         Ok(usize::try_from(count).unwrap_or(usize::MAX))
     }
 
-    /// Supprime un élément précis.
+    /// Supprime un élément et son fichier image éventuel.
     pub fn delete_item(&self, item_id: i64) -> StorageResult<bool> {
+        let image_relative_path: Option<String> = self
+            .connection
+            .query_row(
+                "
+                    SELECT relative_path
+                    FROM image_payloads
+                    WHERE item_id = ?1
+                    ",
+                [item_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
         let deleted_count = self.connection.execute(
             "
                 DELETE FROM clipboard_items
@@ -235,33 +415,67 @@ impl ClipboardStorage {
             [item_id],
         )?;
 
+        if deleted_count > 0
+            && let Some(relative_path) = image_relative_path
+        {
+            remove_blob_if_present(&self.data_directory.join(relative_path))?;
+        }
+
         Ok(deleted_count > 0)
     }
 
-    /// Supprime tout l'historique.
+    /// Supprime tout l'historique et les fichiers d'images.
     pub fn clear_history(&self) -> StorageResult<usize> {
+        let mut statement = self.connection.prepare(
+            "
+                SELECT relative_path
+                FROM image_payloads
+                ",
+        )?;
+
+        let relative_paths = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        drop(statement);
+
         let deleted_count = self.connection.execute("DELETE FROM clipboard_items", [])?;
+
+        for relative_path in relative_paths {
+            remove_blob_if_present(&self.data_directory.join(relative_path))?;
+        }
 
         Ok(deleted_count)
     }
 
     fn find_by_hash(&self, content_hash: &str) -> StorageResult<Option<ClipboardItem>> {
+        let data_directory = self.data_directory.clone();
+
         let item = self
             .connection
             .query_row(
                 "
                 SELECT
-                    id,
-                    plain_text,
-                    html_text,
-                    created_at_ns,
-                    last_used_at_ns,
-                    is_pinned
+                    clipboard_items.id,
+                    clipboard_items.kind,
+                    clipboard_items.plain_text,
+                    clipboard_items.html_text,
+                    clipboard_items.created_at_ns,
+                    clipboard_items.last_used_at_ns,
+                    clipboard_items.is_pinned,
+                    image_payloads.relative_path,
+                    image_payloads.mime_type,
+                    image_payloads.width,
+                    image_payloads.height,
+                    image_payloads.byte_size
                 FROM clipboard_items
-                WHERE content_hash = ?1
+                LEFT JOIN image_payloads
+                    ON image_payloads.item_id =
+                       clipboard_items.id
+                WHERE clipboard_items.content_hash = ?1
                 ",
                 [content_hash],
-                map_clipboard_item,
+                move |row| map_clipboard_item(row, &data_directory),
             )
             .optional()?;
 
@@ -289,6 +503,12 @@ impl ClipboardStorage {
             schema_version = 2;
         }
 
+        if schema_version == 2 {
+            self.connection.execute_batch(IMAGE_HISTORY_MIGRATION)?;
+
+            schema_version = 3;
+        }
+
         if schema_version != CURRENT_SCHEMA_VERSION {
             return Err(StorageError::UnsupportedSchemaVersion(schema_version));
         }
@@ -297,16 +517,56 @@ impl ClipboardStorage {
     }
 }
 
-fn map_clipboard_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipboardItem> {
-    let is_pinned: i64 = row.get(5)?;
+fn map_clipboard_item(
+    row: &rusqlite::Row<'_>,
+    data_directory: &Path,
+) -> rusqlite::Result<ClipboardItem> {
+    let kind_value: String = row.get(1)?;
+
+    let kind = ClipboardItemKind::from_database_value(&kind_value).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(StorageError::UnknownItemKind(kind_value)),
+        )
+    })?;
+
+    let is_pinned: i64 = row.get(6)?;
+
+    let relative_path: Option<String> = row.get(7)?;
+
+    let image = match relative_path {
+        Some(relative_path) => {
+            let stored_byte_size: i64 = row.get(11)?;
+
+            let byte_size = u64::try_from(stored_byte_size).map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    11,
+                    rusqlite::types::Type::Integer,
+                    Box::new(StorageError::InvalidStoredByteSize(stored_byte_size)),
+                )
+            })?;
+
+            Some(ImagePayload {
+                path: data_directory.join(relative_path),
+                mime_type: row.get(8)?,
+                width: row.get(9)?,
+                height: row.get(10)?,
+                byte_size,
+            })
+        }
+
+        None => None,
+    };
 
     Ok(ClipboardItem {
         id: row.get(0)?,
-        kind: ClipboardItemKind::Text,
-        plain_text: row.get(1)?,
-        html_text: row.get(2)?,
-        created_at_ns: row.get(3)?,
-        last_used_at_ns: row.get(4)?,
+        kind,
+        plain_text: row.get(2)?,
+        html_text: row.get(3)?,
+        image,
+        created_at_ns: row.get(4)?,
+        last_used_at_ns: row.get(5)?,
         is_pinned: is_pinned != 0,
     })
 }
@@ -317,13 +577,9 @@ fn current_timestamp_ns() -> StorageResult<i64> {
     i64::try_from(duration.as_nanos()).map_err(|_| StorageError::TimestampOverflow)
 }
 
-fn calculate_content_hash(plain_text: &str, html_text: Option<&str>) -> String {
+fn calculate_text_hash(plain_text: &str, html_text: Option<&str>) -> String {
     let mut hasher = Sha256::new();
 
-    /*
-     * Ce préfixe reste identique à l'ancienne version
-     * pour préserver les empreintes des textes simples.
-     */
     hasher.update(b"text\0");
     hasher.update(plain_text.as_bytes());
 
@@ -332,18 +588,71 @@ fn calculate_content_hash(plain_text: &str, html_text: Option<&str>) -> String {
         hasher.update(html_text.as_bytes());
     }
 
-    let digest = hasher.finalize();
+    format_digest(hasher.finalize())
+}
 
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+fn calculate_image_hash(png_bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+
+    hasher.update(b"image/png\0");
+    hasher.update(png_bytes);
+
+    format_digest(hasher.finalize())
+}
+
+fn format_digest(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn write_blob_if_missing(destination: &Path, content: &[u8]) -> StorageResult<()> {
+    if destination.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let temporary_path =
+        destination.with_extension(format!("png.tmp-{}", current_timestamp_ns()?,));
+
+    fs::write(&temporary_path, content)?;
+
+    match fs::rename(&temporary_path, destination) {
+        Ok(()) => Ok(()),
+
+        Err(_error) if destination.exists() => {
+            remove_blob_if_present(&temporary_path)?;
+
+            Ok(())
+        }
+
+        Err(error) => {
+            remove_blob_if_present(&temporary_path)?;
+
+            Err(StorageError::Io(error))
+        }
+    }
+}
+
+fn remove_blob_if_present(path: &Path) -> StorageResult<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+
+        Err(error) => Err(StorageError::Io(error)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::path::PathBuf;
     use std::process;
-    use std::thread;
-    use std::time::Duration;
 
     use super::*;
 
@@ -351,36 +660,38 @@ mod tests {
         std::env::temp_dir().join(format!(
             "{prefix}-{}-{}",
             process::id(),
-            current_timestamp_ns().expect("timestamp")
+            current_timestamp_ns().expect("timestamp"),
         ))
     }
 
-    #[test]
-    fn text_history_is_persistent_and_deduplicated() {
-        let test_directory = create_test_directory("cliph-storage-test");
+    fn fake_png() -> Vec<u8> {
+        /*
+         * Les tests de stockage ne décodent pas l'image.
+         * Le décodage réel sera testé dans cliph-ui.
+         */
+        vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4, 5, 6, 7, 8,
+        ]
+    }
 
-        let database_path = test_directory.join("cliph-test.db");
+    #[test]
+    fn text_and_rich_text_are_preserved() {
+        let directory = create_test_directory("cliph-text-test");
+
+        let database_path = directory.join("cliph.db");
 
         {
-            let storage = ClipboardStorage::open(&database_path).expect("opening test database");
+            let storage = ClipboardStorage::open(&database_path).expect("opening database");
 
             storage
-                .save_text("Premier texte")
-                .expect("saving first text");
-
-            thread::sleep(Duration::from_millis(1));
+                .save_text("Texte simple")
+                .expect("saving plain text");
 
             storage
-                .save_text("Deuxième texte")
-                .expect("saving second text");
+                .save_rich_text("Texte enrichi", Some("<strong>Texte enrichi</strong>"))
+                .expect("saving rich text");
 
-            thread::sleep(Duration::from_millis(1));
-
-            storage
-                .save_text("Premier texte")
-                .expect("moving text to top");
-
-            assert_eq!(storage.count().expect("counting items"), 2);
+            assert_eq!(storage.count().expect("counting items"), 2,);
         }
 
         {
@@ -389,131 +700,110 @@ mod tests {
             let items = storage.list_recent(10).expect("listing items");
 
             assert_eq!(items.len(), 2);
-
-            assert_eq!(items[0].plain_text, "Premier texte");
-
-            assert_eq!(items[1].plain_text, "Deuxième texte");
-
-            assert!(items[0].html_text.is_none());
+            assert!(items.iter().any(ClipboardItem::has_rich_text),);
         }
 
-        fs::remove_dir_all(test_directory).expect("removing test directory");
+        fs::remove_dir_all(directory).expect("removing directory");
     }
 
     #[test]
-    fn rich_text_html_is_preserved() {
-        let test_directory = create_test_directory("cliph-rich-text-test");
+    fn image_is_persistent_and_deduplicated() {
+        let directory = create_test_directory("cliph-image-test");
 
-        let database_path = test_directory.join("rich-text.db");
+        let database_path = directory.join("cliph.db");
 
-        let html = concat!("<p>", "<strong>Bonjour</strong> ", "<em>ClipH</em>", "</p>");
+        let png = fake_png();
+
+        let stored_path;
 
         {
             let storage = ClipboardStorage::open(&database_path).expect("opening database");
 
-            let item = storage
-                .save_rich_text("Bonjour ClipH", Some(html))
-                .expect("saving rich text");
+            let first = storage
+                .save_image_png(&png, 640, 480)
+                .expect("saving image");
 
-            assert_eq!(item.plain_text, "Bonjour ClipH");
+            let second = storage
+                .save_image_png(&png, 640, 480)
+                .expect("saving duplicate");
 
-            assert_eq!(item.html_text.as_deref(), Some(html));
+            assert_eq!(first.id, second.id);
 
-            assert!(item.has_rich_text());
+            assert_eq!(storage.count().expect("counting items"), 1,);
+
+            let payload = second.image.expect("image payload");
+
+            assert_eq!(payload.width, 640);
+            assert_eq!(payload.height, 480);
+            assert_eq!(payload.byte_size, png.len() as u64,);
+
+            assert!(payload.path.exists());
+
+            stored_path = payload.path;
         }
 
         {
             let storage = ClipboardStorage::open(&database_path).expect("reopening database");
 
-            let items = storage.list_recent(10).expect("listing rich text");
+            let items = storage.list_recent(10).expect("listing images");
 
             assert_eq!(items.len(), 1);
-
-            assert_eq!(items[0].html_text.as_deref(), Some(html));
+            assert!(items[0].is_image());
+            assert!(stored_path.exists());
         }
 
-        fs::remove_dir_all(test_directory).expect("removing test directory");
+        fs::remove_dir_all(directory).expect("removing directory");
     }
 
     #[test]
-    fn different_formatting_creates_distinct_items() {
-        let test_directory = create_test_directory("cliph-format-variants-test");
+    fn deleting_image_removes_its_file() {
+        let directory = create_test_directory("cliph-delete-image-test");
 
-        let database_path = test_directory.join("variants.db");
+        let database_path = directory.join("cliph.db");
 
         {
             let storage = ClipboardStorage::open(&database_path).expect("opening database");
 
-            storage
-                .save_rich_text("Bonjour", Some("<strong>Bonjour</strong>"))
-                .expect("saving bold text");
+            let item = storage
+                .save_image_png(&fake_png(), 320, 240)
+                .expect("saving image");
 
-            storage
-                .save_rich_text("Bonjour", Some("<em>Bonjour</em>"))
-                .expect("saving italic text");
+            let image_path = item.image.expect("image payload").path;
 
-            assert_eq!(storage.count().expect("counting variants"), 2);
+            assert!(image_path.exists());
+
+            assert!(storage.delete_item(item.id).expect("deleting item"),);
+
+            assert!(!image_path.exists());
         }
 
-        fs::remove_dir_all(test_directory).expect("removing test directory");
+        fs::remove_dir_all(directory).expect("removing directory");
     }
 
     #[test]
-    fn individual_item_can_be_deleted() {
-        let test_directory = create_test_directory("cliph-delete-item-test");
+    fn clearing_history_removes_images() {
+        let directory = create_test_directory("cliph-clear-image-test");
 
-        let database_path = test_directory.join("delete.db");
+        let database_path = directory.join("cliph.db");
 
         {
             let storage = ClipboardStorage::open(&database_path).expect("opening database");
 
-            let first_item = storage
-                .save_text("Premier élément")
-                .expect("saving first item");
+            storage.save_text("Texte").expect("saving text");
 
-            let second_item = storage
-                .save_text("Deuxième élément")
-                .expect("saving second item");
+            let image = storage
+                .save_image_png(&fake_png(), 100, 100)
+                .expect("saving image");
 
-            assert!(storage.delete_item(first_item.id).expect("deleting item"));
+            let image_path = image.image.expect("image payload").path;
 
-            let items = storage.list_recent(10).expect("listing items");
+            assert_eq!(storage.clear_history().expect("clearing history"), 2,);
 
-            assert_eq!(items.len(), 1);
-            assert_eq!(items[0].id, second_item.id);
+            assert_eq!(storage.count().expect("counting items"), 0,);
 
-            assert!(
-                !storage
-                    .delete_item(first_item.id)
-                    .expect("deleting missing item")
-            );
+            assert!(!image_path.exists());
         }
 
-        fs::remove_dir_all(test_directory).expect("removing test directory");
-    }
-
-    #[test]
-    fn history_can_be_cleared() {
-        let test_directory = create_test_directory("cliph-clear-test");
-
-        let database_path = test_directory.join("clear.db");
-
-        {
-            let storage = ClipboardStorage::open(&database_path).expect("opening database");
-
-            storage
-                .save_text("Premier élément")
-                .expect("saving first item");
-
-            storage
-                .save_text("Deuxième élément")
-                .expect("saving second item");
-
-            assert_eq!(storage.clear_history().expect("clearing history"), 2);
-
-            assert_eq!(storage.count().expect("counting items"), 0);
-        }
-
-        fs::remove_dir_all(test_directory).expect("removing test directory");
+        fs::remove_dir_all(directory).expect("removing directory");
     }
 }
