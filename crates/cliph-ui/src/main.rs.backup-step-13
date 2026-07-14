@@ -13,36 +13,22 @@ const DISPLAYED_HISTORY_LIMIT: usize = 200;
 const GLOBAL_SHORTCUT_ID: &str = "toggle-cliph";
 const GLOBAL_SHORTCUT_TRIGGER: &str = "LOGO+h";
 
-#[derive(Debug, Clone)]
-struct DisplayedItem {
-    id: i64,
-    plain_text: String,
-}
+type DisplayedHistory = Rc<RefCell<Vec<String>>>;
 
-type DisplayedHistory = Rc<RefCell<Vec<DisplayedItem>>>;
-
-fn create_history_row(
-    item: &ClipboardItem,
-    storage: Rc<ClipboardStorage>,
-    history_list: gtk::ListBox,
-    empty_state: gtk::Label,
-    counter_label: gtk::Label,
-    displayed_history: DisplayedHistory,
-    toast_overlay: adw::ToastOverlay,
-) -> gtk::ListBoxRow {
+fn create_history_row(item: &ClipboardItem) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
 
+    // La ligne peut être activée avec la souris ou le clavier.
     row.set_activatable(true);
     row.set_selectable(false);
     row.set_tooltip_text(Some(
-        "Cliquer sur la ligne pour remettre cet élément dans le presse-papiers",
+        "Cliquer pour remettre cet élément dans le presse-papiers",
     ));
 
     let type_label = gtk::Label::new(Some("TEXTE"));
     type_label.set_halign(Align::Start);
     type_label.add_css_class("caption");
     type_label.add_css_class("dim-label");
-    type_label.set_can_target(false);
 
     let preview = gtk::Label::new(Some(&item.plain_text));
     preview.set_halign(Align::Fill);
@@ -52,6 +38,8 @@ fn create_history_row(
     preview.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     preview.set_lines(4);
     preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
+
+    // Le label ne doit pas intercepter le clic destiné à la ligne.
     preview.set_can_target(false);
 
     let character_count = item.plain_text.chars().count();
@@ -65,7 +53,6 @@ fn create_history_row(
     metadata_label.set_halign(Align::Start);
     metadata_label.add_css_class("caption");
     metadata_label.add_css_class("dim-label");
-    metadata_label.set_can_target(false);
 
     let text_content = gtk::Box::new(Orientation::Vertical, 6);
     text_content.set_hexpand(true);
@@ -78,71 +65,15 @@ fn create_history_row(
     copy_icon.add_css_class("dim-label");
     copy_icon.set_can_target(false);
 
-    let delete_button = gtk::Button::from_icon_name("edit-delete-symbolic");
-
-    delete_button.set_tooltip_text(Some("Supprimer cet élément de l’historique"));
-    delete_button.add_css_class("flat");
-    delete_button.set_valign(Align::Center);
-    delete_button.set_focus_on_click(false);
-
-    let actions = gtk::Box::new(Orientation::Horizontal, 6);
-    actions.set_valign(Align::Center);
-    actions.append(&copy_icon);
-    actions.append(&delete_button);
-
     let row_content = gtk::Box::new(Orientation::Horizontal, 12);
     row_content.set_margin_top(12);
     row_content.set_margin_bottom(12);
     row_content.set_margin_start(14);
     row_content.set_margin_end(14);
     row_content.append(&text_content);
-    row_content.append(&actions);
+    row_content.append(&copy_icon);
 
     row.set_child(Some(&row_content));
-
-    let item_id = item.id;
-
-    let storage_for_delete = storage;
-    let history_list_for_delete = history_list;
-    let row_for_delete = row.clone();
-    let empty_state_for_delete = empty_state;
-    let counter_for_delete = counter_label;
-    let displayed_for_delete = displayed_history;
-    let toast_for_delete = toast_overlay;
-
-    delete_button.connect_clicked(move |_| match storage_for_delete.delete_item(item_id) {
-        Ok(true) => {
-            history_list_for_delete.remove(&row_for_delete);
-
-            displayed_for_delete
-                .borrow_mut()
-                .retain(|displayed_item| displayed_item.id != item_id);
-
-            let total_count = match storage_for_delete.count() {
-                Ok(count) => count,
-
-                Err(error) => {
-                    eprintln!("Impossible de compter les éléments après suppression : {error}");
-
-                    displayed_for_delete.borrow().len()
-                }
-            };
-
-            update_history_status(total_count, &empty_state_for_delete, &counter_for_delete);
-
-            show_toast(&toast_for_delete, "Élément supprimé de l’historique");
-        }
-
-        Ok(false) => {
-            show_toast(&toast_for_delete, "Cet élément a déjà été supprimé");
-        }
-
-        Err(error) => {
-            eprintln!("Impossible de supprimer l’élément {item_id} : {error}");
-
-            show_toast(&toast_for_delete, "Impossible de supprimer cet élément");
-        }
-    });
 
     row
 }
@@ -153,60 +84,36 @@ fn clear_history_list(history_list: &gtk::ListBox) {
     }
 }
 
-fn update_history_status(total_count: usize, empty_state: &gtk::Label, counter_label: &gtk::Label) {
-    let counter_text = match total_count {
-        0 => String::from("0 élément"),
-        1 => String::from("1 élément enregistré"),
-        count => format!("{count} éléments enregistrés"),
-    };
-
-    counter_label.set_text(&counter_text);
-
-    empty_state.set_label("L’historique est vide.\n\nCopiez un texte avec Ctrl + C.");
-
-    empty_state.set_visible(total_count == 0);
-}
-
 fn refresh_history(
-    storage: &Rc<ClipboardStorage>,
+    storage: &ClipboardStorage,
     history_list: &gtk::ListBox,
     empty_state: &gtk::Label,
     counter_label: &gtk::Label,
     displayed_history: &DisplayedHistory,
-    toast_overlay: &adw::ToastOverlay,
 ) {
     match storage.list_recent(DISPLAYED_HISTORY_LIMIT) {
         Ok(items) => {
             clear_history_list(history_list);
 
-            {
-                let mut displayed_items = displayed_history.borrow_mut();
-
-                displayed_items.clear();
-
-                displayed_items.extend(items.iter().map(|item| DisplayedItem {
-                    id: item.id,
-                    plain_text: item.plain_text.clone(),
-                }));
-            }
+            let mut displayed_items = displayed_history.borrow_mut();
+            displayed_items.clear();
 
             for item in &items {
-                let row = create_history_row(
-                    item,
-                    storage.clone(),
-                    history_list.clone(),
-                    empty_state.clone(),
-                    counter_label.clone(),
-                    displayed_history.clone(),
-                    toast_overlay.clone(),
-                );
-
-                history_list.append(&row);
+                displayed_items.push(item.plain_text.clone());
+                history_list.append(&create_history_row(item));
             }
 
             let total_count = storage.count().unwrap_or(items.len());
 
-            update_history_status(total_count, empty_state, counter_label);
+            let counter_text = match total_count {
+                0 => String::from("0 élément"),
+                1 => String::from("1 élément enregistré"),
+                count => format!("{count} éléments enregistrés"),
+            };
+
+            counter_label.set_text(&counter_text);
+            empty_state.set_label("L’historique est vide.\n\nCopiez un texte avec Ctrl + C.");
+            empty_state.set_visible(items.is_empty());
         }
 
         Err(error) => {
@@ -216,9 +123,7 @@ fn refresh_history(
             displayed_history.borrow_mut().clear();
 
             counter_label.set_text("Erreur de chargement");
-
             empty_state.set_label("ClipH n’a pas pu charger l’historique.\nConsultez le terminal.");
-
             empty_state.set_visible(true);
         }
     }
@@ -231,7 +136,6 @@ fn capture_clipboard_text(
     empty_state: gtk::Label,
     counter_label: gtk::Label,
     displayed_history: DisplayedHistory,
-    toast_overlay: adw::ToastOverlay,
 ) {
     let formats = clipboard.formats();
 
@@ -247,54 +151,46 @@ fn capture_clipboard_text(
         return;
     }
 
-    clipboard.read_text_async(None::<&gio::Cancellable>, move |result| {
-        match result {
-            Ok(Some(text)) => {
-                let text = text.to_string();
+    clipboard.read_text_async(None::<&gio::Cancellable>, move |result| match result {
+        Ok(Some(text)) => {
+            let text = text.to_string();
 
-                if text.trim().is_empty() {
-                    return;
+            if text.trim().is_empty() {
+                return;
+            }
+
+            match storage.save_text(&text) {
+                Ok(_) => {
+                    refresh_history(
+                        &storage,
+                        &history_list,
+                        &empty_state,
+                        &counter_label,
+                        &displayed_history,
+                    );
                 }
 
-                match storage.save_text(&text) {
-                    Ok(_) => {
-                        refresh_history(
-                            &storage,
-                            &history_list,
-                            &empty_state,
-                            &counter_label,
-                            &displayed_history,
-                            &toast_overlay,
-                        );
-                    }
-
-                    Err(error) => {
-                        eprintln!(
-                            "Impossible d’enregistrer le contenu du presse-papiers : {error}"
-                        );
-                    }
+                Err(error) => {
+                    eprintln!("Impossible d’enregistrer le contenu du presse-papiers : {error}");
                 }
             }
+        }
 
-            Ok(None) => {
-                // Aucun texte exploitable.
-            }
+        Ok(None) => {
+            // Aucun texte exploitable.
+        }
 
-            Err(_) => {
-                /*
-                 * Le contenu peut changer ou disparaître entre
-                 * la détection du format et sa lecture.
-                 *
-                 * Ce comportement est normal et peut être ignoré.
-                 */
-            }
+        Err(_) => {
+            /*
+             * Le contenu peut changer ou disparaître entre la détection
+             * du format et sa lecture. Ce cas est normal et peut être ignoré.
+             */
         }
     });
 }
 
 fn show_startup_error(app: &adw::Application, message: &str) {
     let title = gtk::Label::new(Some("ClipH ne peut pas démarrer"));
-
     title.add_css_class("title-2");
 
     let details = gtk::Label::new(Some(message));
@@ -326,7 +222,6 @@ fn show_startup_error(app: &adw::Application, message: &str) {
 fn show_toast(toast_overlay: &adw::ToastOverlay, message: &str) {
     let toast = adw::Toast::new(message);
     toast.set_timeout(3);
-
     toast_overlay.add_toast(toast);
 }
 
@@ -402,7 +297,7 @@ async fn run_global_shortcut(
 
     /*
      * La session reste vivante pendant toute la boucle.
-     * Lorsqu'elle se termine, le raccourci est libéré.
+     * Lorsqu'elle se termine, le raccourci est automatiquement libéré.
      */
     drop(session);
 
@@ -415,9 +310,7 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
 
         Err(error) => {
             eprintln!("Impossible d’initialiser ClipH : {error}");
-
             show_startup_error(app, &error.to_string());
-
             return;
         }
     };
@@ -430,19 +323,12 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     let displayed_history: DisplayedHistory = Rc::new(RefCell::new(Vec::new()));
 
     let header_title = gtk::Label::new(Some("ClipH"));
-
     header_title.add_css_class("heading");
 
     let header_bar = adw::HeaderBar::new();
     header_bar.set_title_widget(Some(&header_title));
 
-    /*
-     * Bouton permettant de quitter complètement ClipH.
-     *
-     * La croix normale de la fenêtre ne fait que la masquer.
-     */
     let quit_button = gtk::Button::from_icon_name("application-exit-symbolic");
-
     quit_button.set_tooltip_text(Some("Quitter complètement ClipH"));
     quit_button.add_css_class("flat");
 
@@ -455,27 +341,23 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     header_bar.pack_end(&quit_button);
 
     let title = gtk::Label::new(Some("Historique du presse-papiers"));
-
     title.set_halign(Align::Start);
     title.add_css_class("title-2");
 
     let description = gtk::Label::new(Some(
         "Cliquez sur un élément pour le remettre dans le presse-papiers.",
     ));
-
     description.set_halign(Align::Start);
     description.set_xalign(0.0);
     description.set_wrap(true);
     description.add_css_class("dim-label");
 
     let counter_label = gtk::Label::new(Some("0 élément"));
-
     counter_label.set_halign(Align::Start);
     counter_label.add_css_class("caption");
     counter_label.add_css_class("dim-label");
 
     let introduction = gtk::Box::new(Orientation::Vertical, 6);
-
     introduction.append(&title);
     introduction.append(&description);
     introduction.append(&counter_label);
@@ -483,7 +365,6 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     let empty_state = gtk::Label::new(Some(
         "L’historique est vide.\n\nCopiez un texte avec Ctrl + C.",
     ));
-
     empty_state.set_halign(Align::Center);
     empty_state.set_valign(Align::Center);
     empty_state.set_justify(gtk::Justification::Center);
@@ -492,13 +373,11 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     empty_state.add_css_class("dim-label");
 
     let history_list = gtk::ListBox::new();
-
     history_list.set_selection_mode(gtk::SelectionMode::None);
     history_list.set_activate_on_single_click(true);
     history_list.add_css_class("boxed-list");
 
     let history_container = gtk::Box::new(Orientation::Vertical, 12);
-
     history_container.append(&empty_state);
     history_container.append(&history_list);
 
@@ -510,7 +389,6 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
         .build();
 
     let content = gtk::Box::new(Orientation::Vertical, 18);
-
     content.set_margin_top(24);
     content.set_margin_bottom(24);
     content.set_margin_start(24);
@@ -519,7 +397,6 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     content.append(&scrolled_window);
 
     let page = gtk::Box::new(Orientation::Vertical, 0);
-
     page.append(&header_bar);
     page.append(&content);
 
@@ -534,30 +411,25 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
         .content(&toast_overlay)
         .build();
 
-    /*
-     * Fermer la fenêtre avec la croix ne quitte pas ClipH.
-     * L'application continue à surveiller le presse-papiers.
-     */
     window.set_hide_on_close(true);
 
     /*
-     * Bouton permettant d'effacer tout l'historique.
+     * Bouton d'effacement global.
+     *
+     * Le MenuButton ouvre une confirmation avant toute suppression.
      */
     let clear_menu_button = gtk::MenuButton::new();
-
     clear_menu_button.set_icon_name("edit-delete-symbolic");
     clear_menu_button.set_tooltip_text(Some("Effacer tout l’historique"));
     clear_menu_button.add_css_class("flat");
 
     let confirmation_title = gtk::Label::new(Some("Effacer tout l’historique ?"));
-
     confirmation_title.set_halign(Align::Start);
     confirmation_title.add_css_class("heading");
 
     let confirmation_text = gtk::Label::new(Some(
         "Tous les textes enregistrés seront définitivement supprimés.",
     ));
-
     confirmation_text.set_halign(Align::Start);
     confirmation_text.set_xalign(0.0);
     confirmation_text.set_wrap(true);
@@ -565,7 +437,6 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     confirmation_text.add_css_class("dim-label");
 
     let confirm_clear_button = gtk::Button::with_label("Tout effacer");
-
     confirm_clear_button.add_css_class("destructive-action");
 
     let confirmation_content = gtk::Box::new(Orientation::Vertical, 12);
@@ -580,16 +451,11 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     confirmation_content.append(&confirm_clear_button);
 
     let clear_popover = gtk::Popover::new();
-
     clear_popover.set_child(Some(&confirmation_content));
 
     clear_menu_button.set_popover(Some(&clear_popover));
-
     header_bar.pack_end(&clear_menu_button);
 
-    /*
-     * Clones réservés à la closure du bouton d'effacement.
-     */
     let storage_for_clear = storage.clone();
     let list_for_clear = history_list.clone();
     let empty_state_for_clear = empty_state.clone();
@@ -611,15 +477,11 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
                     &empty_state_for_clear,
                     &counter_for_clear,
                     &displayed_for_clear,
-                    &toast_for_clear,
                 );
 
                 let message = match deleted_count {
                     1 => String::from("1 élément supprimé"),
-
-                    count => {
-                        format!("{count} éléments supprimés")
-                    }
+                    count => format!("{count} éléments supprimés"),
                 };
 
                 show_toast(&toast_for_clear, &message);
@@ -635,19 +497,12 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
         popover_for_clear.popdown();
     });
 
-    /*
-     * Premier chargement de l'historique.
-     *
-     * On utilise toast_overlay directement ici.
-     * toast_for_clear appartient déjà à la closure précédente.
-     */
     refresh_history(
         &storage,
         &history_list,
         &empty_state,
         &counter_label,
         &displayed_history,
-        &toast_overlay,
     );
 
     let display =
@@ -656,13 +511,11 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     let clipboard = display.clipboard();
 
     /*
-     * Lorsqu'une ligne est activée, son contenu est remis
-     * dans le presse-papiers.
+     * Lorsqu'une ligne est activée, son texte est récupéré à partir
+     * de sa position dans la liste, puis remis dans le presse-papiers.
      */
     let displayed_for_activation = displayed_history.clone();
-
     let clipboard_for_activation = clipboard.clone();
-
     let toast_for_activation = toast_overlay.clone();
 
     history_list.connect_row_activated(move |_, row| {
@@ -675,35 +528,26 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
         let selected_text = displayed_for_activation
             .borrow()
             .get(index as usize)
-            .map(|item| item.plain_text.clone());
+            .cloned();
 
         let Some(selected_text) = selected_text else {
             eprintln!("Élément introuvable pour la ligne {index}");
-
             return;
         };
 
         clipboard_for_activation.set_text(&selected_text);
 
         let toast = adw::Toast::new("Élément copié — utilisez Ctrl + V pour le coller");
-
         toast.set_timeout(2);
 
         toast_for_activation.add_toast(toast);
     });
 
-    /*
-     * Clones réservés au signal de changement
-     * du presse-papiers.
-     *
-     * Le clone du ToastOverlay est créé AVANT la closure move.
-     */
     let storage_for_signal = storage.clone();
     let list_for_signal = history_list.clone();
     let empty_state_for_signal = empty_state.clone();
     let counter_for_signal = counter_label.clone();
     let displayed_for_signal = displayed_history.clone();
-    let toast_for_signal = toast_overlay.clone();
 
     clipboard.connect_changed(move |changed_clipboard| {
         capture_clipboard_text(
@@ -713,14 +557,9 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
             empty_state_for_signal.clone(),
             counter_for_signal.clone(),
             displayed_for_signal.clone(),
-            toast_for_signal.clone(),
         );
     });
 
-    /*
-     * Capture le contenu déjà présent dans le presse-papiers
-     * au moment du démarrage de ClipH.
-     */
     capture_clipboard_text(
         &clipboard,
         storage,
@@ -728,7 +567,6 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
         empty_state,
         counter_label,
         displayed_history,
-        toast_overlay.clone(),
     );
 
     setup_global_shortcut(&window, &toast_overlay);
@@ -746,15 +584,15 @@ fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
 
     /*
-     * Le garde reste vivant jusqu'à la fin du programme.
-     * ClipH continue à fonctionner lorsque sa fenêtre est masquée.
+     * Ce garde reste vivant jusqu'à la fin du programme.
+     * ClipH continue ainsi à fonctionner lorsque sa fenêtre est masquée.
      */
     let _hold_guard = app.hold();
 
     app.connect_activate(move |app| {
         /*
-         * Empêche de recréer l'interface si l'application
-         * reçoit une nouvelle activation.
+         * Empêche de recréer toute l'interface si l'application
+         * reçoit une deuxième activation.
          */
         if app.windows().is_empty() {
             build_ui(app, start_hidden);
@@ -762,8 +600,8 @@ fn main() -> glib::ExitCode {
     });
 
     /*
-     * --background a déjà été traité par notre code.
-     * Il n'est donc pas transmis à GApplication.
+     * On ne transmet pas --background à GApplication,
+     * car nous l'avons déjà traité nous-mêmes.
      */
     app.run_with_args(&["cliph"])
 }

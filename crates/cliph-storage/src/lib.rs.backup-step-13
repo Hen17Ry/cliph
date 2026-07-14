@@ -1,0 +1,359 @@
+//! Stockage persistant de l'historique ClipH.
+
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
+
+use cliph_core::{ClipboardItem, ClipboardItemKind};
+use directories::ProjectDirs;
+use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
+
+const CURRENT_SCHEMA_VERSION: i64 = 1;
+const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
+
+pub type StorageResult<T> = Result<T, StorageError>;
+
+/// Erreurs pouvant survenir pendant l'accès à l'historique.
+#[derive(Debug)]
+pub enum StorageError {
+    ProjectDirectoryUnavailable,
+    Io(std::io::Error),
+    Database(rusqlite::Error),
+    SystemTime(SystemTimeError),
+    TimestampOverflow,
+    UnsupportedSchemaVersion(i64),
+}
+
+impl Display for StorageError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProjectDirectoryUnavailable => {
+                write!(
+                    formatter,
+                    "le répertoire de données de l'utilisateur est indisponible"
+                )
+            }
+            Self::Io(error) => write!(formatter, "erreur d'accès au disque : {error}"),
+            Self::Database(error) => {
+                write!(formatter, "erreur de base de données : {error}")
+            }
+            Self::SystemTime(error) => {
+                write!(formatter, "erreur liée à l'horloge système : {error}")
+            }
+            Self::TimestampOverflow => {
+                write!(formatter, "la date système dépasse la capacité de stockage")
+            }
+            Self::UnsupportedSchemaVersion(version) => {
+                write!(
+                    formatter,
+                    "version de base de données non prise en charge : {version}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for StorageError {}
+
+impl From<std::io::Error> for StorageError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<rusqlite::Error> for StorageError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<SystemTimeError> for StorageError {
+    fn from(error: SystemTimeError) -> Self {
+        Self::SystemTime(error)
+    }
+}
+
+/// Point d'accès au stockage SQLite de ClipH.
+pub struct ClipboardStorage {
+    connection: Connection,
+    database_path: PathBuf,
+}
+
+impl ClipboardStorage {
+    /// Ouvre la base située dans le répertoire standard de ClipH.
+    pub fn open_default() -> StorageResult<Self> {
+        let project_dirs = ProjectDirs::from("com", "ClipH", "ClipH")
+            .ok_or(StorageError::ProjectDirectoryUnavailable)?;
+
+        let data_directory = project_dirs.data_dir();
+        fs::create_dir_all(data_directory)?;
+
+        Self::open(data_directory.join("cliph.db"))
+    }
+
+    /// Ouvre une base précise. Cette méthode facilite également les tests.
+    pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
+        let database_path = path.as_ref().to_path_buf();
+
+        if let Some(parent) = database_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let connection = Connection::open(&database_path)?;
+
+        connection.execute_batch(
+            "
+            PRAGMA foreign_keys = ON;
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA busy_timeout = 5000;
+            ",
+        )?;
+
+        let storage = Self {
+            connection,
+            database_path,
+        };
+
+        storage.run_migrations()?;
+
+        Ok(storage)
+    }
+
+    /// Chemin réel de la base actuellement utilisée.
+    pub fn database_path(&self) -> &Path {
+        &self.database_path
+    }
+
+    /// Enregistre un texte ou le replace en tête s'il existe déjà.
+    pub fn save_text(&self, text: &str) -> StorageResult<ClipboardItem> {
+        let content_hash = calculate_text_hash(text);
+        let now = current_timestamp_ns()?;
+
+        self.connection.execute(
+            "
+            INSERT INTO clipboard_items (
+                kind,
+                plain_text,
+                content_hash,
+                created_at_ns,
+                last_used_at_ns,
+                is_pinned
+            )
+            VALUES (?1, ?2, ?3, ?4, ?4, 0)
+
+            ON CONFLICT(content_hash) DO UPDATE SET
+                plain_text = excluded.plain_text,
+                last_used_at_ns = excluded.last_used_at_ns
+            ",
+            params![
+                ClipboardItemKind::Text.as_database_value(),
+                text,
+                content_hash,
+                now
+            ],
+        )?;
+
+        self.find_by_hash(&content_hash)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows.into())
+    }
+
+    /// Retourne les éléments les plus récents.
+    pub fn list_recent(&self, limit: usize) -> StorageResult<Vec<ClipboardItem>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+
+        let mut statement = self.connection.prepare(
+            "
+            SELECT
+                id,
+                plain_text,
+                created_at_ns,
+                last_used_at_ns,
+                is_pinned
+            FROM clipboard_items
+            ORDER BY
+                is_pinned DESC,
+                last_used_at_ns DESC,
+                id DESC
+            LIMIT ?1
+            ",
+        )?;
+
+        let items = statement
+            .query_map([limit], map_clipboard_item)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(items)
+    }
+
+    /// Nombre total d'éléments enregistrés.
+    pub fn count(&self) -> StorageResult<usize> {
+        let count: i64 =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM clipboard_items", [], |row| row.get(0))?;
+
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
+    pub fn clear_history(&self) -> StorageResult<usize> {
+        let deleted_count = self.connection.execute("DELETE FROM clipboard_items", [])?;
+
+        Ok(deleted_count)
+    }
+
+    fn find_by_hash(&self, content_hash: &str) -> StorageResult<Option<ClipboardItem>> {
+        let item = self
+            .connection
+            .query_row(
+                "
+                SELECT
+                    id,
+                    plain_text,
+                    created_at_ns,
+                    last_used_at_ns,
+                    is_pinned
+                FROM clipboard_items
+                WHERE content_hash = ?1
+                ",
+                [content_hash],
+                map_clipboard_item,
+            )
+            .optional()?;
+
+        Ok(item)
+    }
+
+    fn run_migrations(&self) -> StorageResult<()> {
+        let schema_version: i64 = self
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+        match schema_version {
+            0 => {
+                self.connection.execute_batch(INITIAL_MIGRATION)?;
+                Ok(())
+            }
+            CURRENT_SCHEMA_VERSION => Ok(()),
+            version => Err(StorageError::UnsupportedSchemaVersion(version)),
+        }
+    }
+}
+
+fn map_clipboard_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipboardItem> {
+    let is_pinned: i64 = row.get(4)?;
+
+    Ok(ClipboardItem {
+        id: row.get(0)?,
+        kind: ClipboardItemKind::Text,
+        plain_text: row.get(1)?,
+        created_at_ns: row.get(2)?,
+        last_used_at_ns: row.get(3)?,
+        is_pinned: is_pinned != 0,
+    })
+}
+
+fn current_timestamp_ns() -> StorageResult<i64> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH)?;
+
+    i64::try_from(duration.as_nanos()).map_err(|_| StorageError::TimestampOverflow)
+}
+
+fn calculate_text_hash(text: &str) -> String {
+    let mut hasher = Sha256::new();
+
+    // Le préfixe évitera plus tard qu'un texte et un autre type de contenu
+    // produisent la même identité logique.
+    hasher.update(b"text\0");
+    hasher.update(text.as_bytes());
+
+    let digest = hasher.finalize();
+
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::process;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn text_history_is_persistent_and_deduplicated() {
+        let test_directory = std::env::temp_dir().join(format!(
+            "cliph-storage-test-{}-{}",
+            process::id(),
+            current_timestamp_ns().expect("timestamp")
+        ));
+
+        let database_path = test_directory.join("cliph-test.db");
+
+        {
+            let storage = ClipboardStorage::open(&database_path).expect("opening test database");
+
+            storage
+                .save_text("Premier texte")
+                .expect("saving first text");
+
+            thread::sleep(Duration::from_millis(1));
+
+            storage
+                .save_text("Deuxième texte")
+                .expect("saving second text");
+
+            thread::sleep(Duration::from_millis(1));
+
+            storage
+                .save_text("Premier texte")
+                .expect("moving existing text to the top");
+
+            assert_eq!(storage.count().expect("counting items"), 2);
+
+            let items = storage.list_recent(10).expect("listing items");
+
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].plain_text, "Premier texte");
+            assert_eq!(items[1].plain_text, "Deuxième texte");
+        }
+
+        fs::remove_dir_all(test_directory).expect("removing test directory");
+    }
+
+    #[test]
+    fn history_can_be_cleared() {
+        let test_directory = std::env::temp_dir().join(format!(
+            "cliph-clear-test-{}-{}",
+            process::id(),
+            current_timestamp_ns().expect("timestamp")
+        ));
+
+        let database_path = test_directory.join("cliph-clear-test.db");
+
+        {
+            let storage = ClipboardStorage::open(&database_path).expect("opening test database");
+
+            storage
+                .save_text("Premier élément")
+                .expect("saving first item");
+
+            storage
+                .save_text("Deuxième élément")
+                .expect("saving second item");
+
+            assert_eq!(storage.count().expect("counting before clear"), 2);
+
+            let deleted_count = storage.clear_history().expect("clearing history");
+
+            assert_eq!(deleted_count, 2);
+            assert_eq!(storage.count().expect("counting after clear"), 0);
+            assert!(storage.list_recent(10).expect("listing history").is_empty());
+        }
+
+        fs::remove_dir_all(test_directory).expect("removing test directory");
+    }
+}

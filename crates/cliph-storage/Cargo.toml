@@ -1,5 +1,5 @@
 [package]
-name = "cliph-ui"
+name = "cliph-storage"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,9 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-adw.workspace = true
-gtk.workspace = true
 cliph-core = { path = "../cliph-core" }
-cliph-storage = { path = "../cliph-storage" }
-ashpd.workspace = true
-futures-util.workspace = true
+directories.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
