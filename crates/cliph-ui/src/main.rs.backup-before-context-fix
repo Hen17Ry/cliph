@@ -86,15 +86,6 @@ impl PublishedKind {
 
 type DisplayedHistory = Rc<RefCell<Vec<DisplayedItem>>>;
 
-struct TextCaptureContext {
-    storage: Rc<ClipboardStorage>,
-    history_list: gtk::ListBox,
-    empty_state: gtk::Label,
-    counter_label: gtk::Label,
-    displayed_history: DisplayedHistory,
-    toast_overlay: adw::ToastOverlay,
-}
-
 fn show_toast(toast_overlay: &adw::ToastOverlay, message: &str) {
     let toast = adw::Toast::new(message);
     toast.set_timeout(3);
@@ -581,7 +572,12 @@ fn capture_image_content(
 
 fn capture_text_content(
     clipboard: gdk::Clipboard,
-    context: TextCaptureContext,
+    storage: Rc<ClipboardStorage>,
+    history_list: gtk::ListBox,
+    empty_state: gtk::Label,
+    counter_label: gtk::Label,
+    displayed_history: DisplayedHistory,
+    toast_overlay: adw::ToastOverlay,
     available_mime_types: Vec<String>,
 ) {
     glib::MainContext::default().spawn_local(async move {
@@ -597,22 +593,21 @@ fn capture_text_content(
 
         let html_text = read_html_from_clipboard(&clipboard).await;
 
-        match context.storage.save_text_with_formats(
+        match storage.save_text_with_formats(
             &plain_text,
             html_text.as_deref(),
             &available_mime_types,
         ) {
             Ok(_) => {
                 refresh_history(
-                    &context.storage,
-                    &context.history_list,
-                    &context.empty_state,
-                    &context.counter_label,
-                    &context.displayed_history,
-                    &context.toast_overlay,
+                    &storage,
+                    &history_list,
+                    &empty_state,
+                    &counter_label,
+                    &displayed_history,
+                    &toast_overlay,
                 );
             }
-
             Err(error) => {
                 eprintln!("Impossible d’enregistrer le contenu du presse-papiers : {error}");
             }
@@ -675,14 +670,12 @@ fn capture_clipboard_content(
     if contains_text {
         capture_text_content(
             clipboard.clone(),
-            TextCaptureContext {
-                storage,
-                history_list,
-                empty_state,
-                counter_label,
-                displayed_history,
-                toast_overlay,
-            },
+            storage,
+            history_list,
+            empty_state,
+            counter_label,
+            displayed_history,
+            toast_overlay,
             available_mime_types,
         );
     }

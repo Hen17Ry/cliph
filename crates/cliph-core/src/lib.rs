@@ -2,11 +2,19 @@
 
 use std::path::PathBuf;
 
-/// Type principal d'un élément enregistré.
+pub mod classifier;
+
+pub use classifier::{ClassificationResult, ClipboardClassification, classify_text};
+
+/// Type technique principal d'un élément enregistré.
+///
+/// La classification sémantique est conservée séparément dans
+/// `ClipboardItem::classification`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardItemKind {
     Text,
     Image,
+    Files,
 }
 
 impl ClipboardItemKind {
@@ -15,6 +23,7 @@ impl ClipboardItemKind {
         match self {
             Self::Text => "text",
             Self::Image => "image",
+            Self::Files => "files",
         }
     }
 
@@ -23,6 +32,7 @@ impl ClipboardItemKind {
         match value {
             "text" => Some(Self::Text),
             "image" => Some(Self::Image),
+            "files" => Some(Self::Files),
             _ => None,
         }
     }
@@ -33,7 +43,6 @@ impl ClipboardItemKind {
 pub struct ImagePayload {
     /// Chemin absolu du fichier PNG conservé par ClipH.
     pub path: PathBuf,
-
     pub mime_type: String,
     pub width: i32,
     pub height: i32,
@@ -46,10 +55,22 @@ pub struct ClipboardItem {
     pub id: i64,
     pub kind: ClipboardItemKind,
 
+    /// Classification sémantique calculée par le moteur ClipH.
+    pub classification: ClipboardClassification,
+
+    /// Langage, protocole, format de tableau ou autre précision.
+    pub classification_subtype: Option<String>,
+
+    /// Niveau de confiance du classificateur, compris entre 0 et 100.
+    pub classification_confidence: u8,
+
+    /// Représentations MIME connues pour cet élément.
+    pub mime_types: Vec<String>,
+
     /// Texte simple. Cette chaîne est vide pour une image.
     pub plain_text: String,
 
-    /// Représentation HTML facultative d'un texte enrichi.
+    /// Représentation HTML facultative.
     pub html_text: Option<String>,
 
     /// Informations de l'image lorsque `kind == Image`.
@@ -71,5 +92,14 @@ impl ClipboardItem {
 
     pub const fn is_image(&self) -> bool {
         matches!(self.kind, ClipboardItemKind::Image)
+    }
+
+    pub const fn is_files(&self) -> bool {
+        matches!(self.kind, ClipboardItemKind::Files)
+    }
+
+    /// Libellé principal destiné à l'interface.
+    pub const fn classification_label(&self) -> &'static str {
+        self.classification.display_label()
     }
 }
