@@ -22,6 +22,12 @@ const APP_ID: &str = "com.cliph.ClipH";
 const DISPLAYED_HISTORY_LIMIT: usize = 200;
 const GLOBAL_SHORTCUT_ID: &str = "toggle-cliph";
 const GLOBAL_SHORTCUT_TRIGGER: &str = "LOGO+h";
+
+const FALLBACK_GLOBAL_SHORTCUT_ID: &str = "toggle-cliph-safe";
+const FALLBACK_GLOBAL_SHORTCUT_TRIGGER: &str = "CTRL+LOGO+h";
+
+const GNOME_WM_KEYBINDINGS_SCHEMA: &str = "org.gnome.desktop.wm.keybindings";
+const GNOME_MINIMIZE_KEY: &str = "minimize";
 const HTML_MIME_TYPES: &[&str] = &[
     "text/html",
     "text/html;charset=utf-8",
@@ -1503,14 +1509,73 @@ fn show_startup_error(app: &adw::Application, message: &str) {
     window.present();
 }
 
+fn shortcut_binding_is_super_h(binding: &str) -> bool {
+    matches!(
+        binding.trim().to_ascii_lowercase().as_str(),
+        "<super>h" | "<meta>h"
+    )
+}
+
+fn gnome_uses_super_h_for_minimize() -> bool {
+    let Some(schema_source) = gio::SettingsSchemaSource::default() else {
+        return false;
+    };
+
+    if schema_source
+        .lookup(GNOME_WM_KEYBINDINGS_SCHEMA, true)
+        .is_none()
+    {
+        return false;
+    }
+
+    let settings = gio::Settings::new(GNOME_WM_KEYBINDINGS_SCHEMA);
+
+    settings
+        .strv(GNOME_MINIMIZE_KEY)
+        .iter()
+        .any(|binding| shortcut_binding_is_super_h(binding.as_str()))
+}
+
 fn setup_global_shortcut(window: &adw::ApplicationWindow, toast_overlay: &adw::ToastOverlay) {
     let window = window.clone();
     let toast_overlay = toast_overlay.clone();
 
+    let (shortcut_id, shortcut_trigger, shortcut_label) = if gnome_uses_super_h_for_minimize() {
+        eprintln!(
+            "Windows + H est déjà utilisé par GNOME. \
+             ClipH utilisera Ctrl + Windows + H."
+        );
+
+        show_toast(
+            &toast_overlay,
+            "Windows + H est occupé — utilisez Ctrl + Windows + H",
+        );
+
+        (
+            FALLBACK_GLOBAL_SHORTCUT_ID,
+            FALLBACK_GLOBAL_SHORTCUT_TRIGGER,
+            "Ctrl + Windows + H",
+        )
+    } else {
+        (GLOBAL_SHORTCUT_ID, GLOBAL_SHORTCUT_TRIGGER, "Windows + H")
+    };
+
     glib::MainContext::default().spawn_local(async move {
-        if let Err(error) = run_global_shortcut(window, toast_overlay.clone()).await {
-            eprintln!("Impossible d’activer Windows + H : {error}");
-            show_toast(&toast_overlay, "Impossible d’activer Windows + H");
+        if let Err(error) = run_global_shortcut(
+            window,
+            toast_overlay.clone(),
+            shortcut_id,
+            shortcut_trigger,
+            shortcut_label,
+        )
+        .await
+        {
+            eprintln!("Impossible d’activer {shortcut_label} : {error}");
+
+            show_toast(
+                &toast_overlay,
+                &format!("Impossible d’activer {shortcut_label}"),
+            );
         }
     });
 }
@@ -1518,15 +1583,18 @@ fn setup_global_shortcut(window: &adw::ApplicationWindow, toast_overlay: &adw::T
 async fn run_global_shortcut(
     window: adw::ApplicationWindow,
     toast_overlay: adw::ToastOverlay,
+    shortcut_id: &'static str,
+    shortcut_trigger: &'static str,
+    shortcut_label: &'static str,
 ) -> ashpd::Result<()> {
     let portal = GlobalShortcuts::new().await?;
 
-    println!("Version du portail GlobalShortcuts : {}", portal.version());
+    println!("Version du portail GlobalShortcuts : {}", portal.version(),);
 
     let session = portal.create_session(Default::default()).await?;
 
-    let shortcut = NewShortcut::new(GLOBAL_SHORTCUT_ID, "Afficher ou masquer ClipH")
-        .preferred_trigger(GLOBAL_SHORTCUT_TRIGGER);
+    let shortcut = NewShortcut::new(shortcut_id, "Afficher ou masquer ClipH")
+        .preferred_trigger(shortcut_trigger);
 
     let bind_request = portal
         .bind_shortcuts(&session, &[shortcut], None, Default::default())
@@ -1537,28 +1605,37 @@ async fn run_global_shortcut(
     let shortcut_is_bound = bind_response
         .shortcuts()
         .iter()
-        .any(|shortcut| shortcut.id() == GLOBAL_SHORTCUT_ID);
+        .any(|shortcut| shortcut.id() == shortcut_id);
 
     if !shortcut_is_bound {
-        eprintln!("Le raccourci Windows + H n’a pas été autorisé.");
-        show_toast(&toast_overlay, "Windows + H n’a pas été autorisé");
+        eprintln!("Le raccourci {shortcut_label} n’a pas été autorisé.");
+
+        show_toast(
+            &toast_overlay,
+            &format!("{shortcut_label} n’a pas été autorisé"),
+        );
+
         return Ok(());
     }
 
     let trigger_description = bind_response
         .shortcuts()
         .iter()
-        .find(|shortcut| shortcut.id() == GLOBAL_SHORTCUT_ID)
+        .find(|shortcut| shortcut.id() == shortcut_id)
         .map(|shortcut| shortcut.trigger_description())
-        .unwrap_or("Windows + H");
+        .unwrap_or(shortcut_label);
 
     println!("Raccourci global actif : {trigger_description}");
-    show_toast(&toast_overlay, "Windows + H est maintenant actif");
+
+    show_toast(
+        &toast_overlay,
+        &format!("{shortcut_label} est maintenant actif"),
+    );
 
     let mut activations = portal.receive_activated().await?;
 
     while let Some(activation) = activations.next().await {
-        if activation.shortcut_id() != GLOBAL_SHORTCUT_ID {
+        if activation.shortcut_id() != shortcut_id {
             continue;
         }
 
@@ -1570,6 +1647,7 @@ async fn run_global_shortcut(
     }
 
     drop(session);
+
     Ok(())
 }
 
@@ -1905,4 +1983,31 @@ fn main() -> glib::ExitCode {
     }
 
     run_application()
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::shortcut_binding_is_super_h;
+
+    #[test]
+    fn detects_gnome_super_h_binding() {
+        assert!(shortcut_binding_is_super_h("<Super>h",));
+    }
+
+    #[test]
+    fn detects_meta_h_binding() {
+        assert!(shortcut_binding_is_super_h("<Meta>h",));
+    }
+
+    #[test]
+    fn detection_is_case_insensitive() {
+        assert!(shortcut_binding_is_super_h("<SUPER>H",));
+    }
+
+    #[test]
+    fn ignores_unrelated_shortcuts() {
+        assert!(!shortcut_binding_is_super_h("<Control><Super>h",));
+
+        assert!(!shortcut_binding_is_super_h("<Super>j",));
+    }
 }

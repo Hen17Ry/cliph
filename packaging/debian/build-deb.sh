@@ -166,8 +166,9 @@ ClipH pour Debian et Ubuntu
 
 ClipH démarre automatiquement à l'ouverture d'une session graphique.
 
-Raccourci :
+Raccourcis :
   Super/Windows + H
+  Ctrl + Super/Windows + H lorsque le raccourci principal est occupé
 
 Commandes utiles :
   cliph --version
