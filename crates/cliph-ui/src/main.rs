@@ -1591,11 +1591,23 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
 
     let displayed_history: DisplayedHistory = Rc::new(RefCell::new(Vec::new()));
 
+    let header_logo = gtk::Image::from_icon_name(APP_ID);
+    header_logo.set_pixel_size(28);
+    header_logo.set_tooltip_text(Some("ClipH By Henry Gossou"));
+    header_logo.set_can_target(false);
+
     let header_title = gtk::Label::new(Some("ClipH"));
     header_title.add_css_class("heading");
+    header_title.set_can_target(false);
+
+    let header_identity = gtk::Box::new(Orientation::Horizontal, 8);
+
+    header_identity.set_valign(Align::Center);
+    header_identity.append(&header_logo);
+    header_identity.append(&header_title);
 
     let header_bar = adw::HeaderBar::new();
-    header_bar.set_title_widget(Some(&header_title));
+    header_bar.set_title_widget(Some(&header_identity));
 
     let title = gtk::Label::new(Some("Historique du presse-papiers"));
     title.set_halign(Align::Start);

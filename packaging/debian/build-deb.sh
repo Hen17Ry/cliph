@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+umask 022
+
 PACKAGE_NAME="cliph"
 APP_ID="com.cliph.ClipH"
 SERVICE_NAME="app-${APP_ID}.service"
@@ -30,6 +32,7 @@ for command in \
     dpkg-deb \
     dpkg-shlibdeps \
     dpkg-query \
+    gzip \
     md5sum \
     find \
     sed \
@@ -90,7 +93,6 @@ mkdir -p \
     "$PACKAGE_ROOT/usr/lib/systemd/user" \
     "$PACKAGE_ROOT/usr/share/applications" \
     "$PACKAGE_ROOT/usr/share/doc/$PACKAGE_NAME" \
-    "$PACKAGE_ROOT/etc/systemd/user/graphical-session.target.wants" \
     "$OUTPUT_DIRECTORY" \
     "$BUILD_ROOT/debian"
 
@@ -104,6 +106,22 @@ if command -v strip >/dev/null 2>&1; then
         true
 fi
 
+printf '◆ Installation des icônes officielles\n'
+
+for size in 16 24 32 48 64 128 256 512; do
+    icon_source="$PROJECT_ROOT/assets/icons/hicolor/${size}x${size}/apps/${APP_ID}.png"
+    icon_destination="$PACKAGE_ROOT/usr/share/icons/hicolor/${size}x${size}/apps/${APP_ID}.png"
+
+    if [[ ! -f "$icon_source" ]]; then
+        printf 'Icône manquante : %s\n' "$icon_source" >&2
+        exit 1
+    fi
+
+    install -Dm644 \
+        "$icon_source" \
+        "$icon_destination"
+done
+
 printf '◆ Création du lanceur de bureau\n'
 
 cat > "$PACKAGE_ROOT/usr/share/applications/${APP_ID}.desktop" <<EOF
@@ -114,7 +132,7 @@ Name=ClipH By Henry Gossou
 GenericName=Gestionnaire de presse-papiers
 Comment=Historique et insertion rapide du presse-papiers
 Exec=/usr/bin/cliph
-Icon=edit-paste-symbolic
+Icon=com.cliph.ClipH
 Terminal=false
 Categories=Utility;
 Keywords=clipboard;presse-papiers;history;historique;emoji;symbol;
@@ -142,10 +160,6 @@ TimeoutStopSec=5
 WantedBy=graphical-session.target
 EOF
 
-ln -s \
-    "/usr/lib/systemd/user/$SERVICE_NAME" \
-    "$PACKAGE_ROOT/etc/systemd/user/graphical-session.target.wants/$SERVICE_NAME"
-
 cat > "$PACKAGE_ROOT/usr/share/doc/$PACKAGE_NAME/README.Debian" <<'EOF'
 ClipH pour Debian et Ubuntu
 ===========================
@@ -160,6 +174,27 @@ Commandes utiles :
   systemctl --user status app-com.cliph.ClipH.service
   journalctl --user -u app-com.cliph.ClipH.service
 EOF
+
+printf '◆ Installation de la documentation Debian\n'
+
+install -Dm644 \
+    "$PROJECT_ROOT/packaging/debian/copyright" \
+    "$PACKAGE_ROOT/usr/share/doc/$PACKAGE_NAME/copyright"
+
+gzip -9 -n -c \
+    "$PROJECT_ROOT/packaging/debian/changelog" \
+    > "$PACKAGE_ROOT/usr/share/doc/$PACKAGE_NAME/changelog.gz"
+
+mkdir -p "$PACKAGE_ROOT/usr/share/man/man1"
+
+gzip -9 -n -c \
+    "$PROJECT_ROOT/packaging/debian/cliph.1" \
+    > "$PACKAGE_ROOT/usr/share/man/man1/cliph.1.gz"
+
+chmod 0644 \
+    "$PACKAGE_ROOT/usr/share/doc/$PACKAGE_NAME/copyright" \
+    "$PACKAGE_ROOT/usr/share/doc/$PACKAGE_NAME/changelog.gz" \
+    "$PACKAGE_ROOT/usr/share/man/man1/cliph.1.gz"
 
 printf '◆ Détection des dépendances système\n'
 
@@ -192,7 +227,7 @@ if [[ -z "$SHLIBS_DEPENDS" ]]; then
     exit 1
 fi
 
-DEPENDS="$SHLIBS_DEPENDS, xdg-desktop-portal"
+DEPENDS="$SHLIBS_DEPENDS, xdg-desktop-portal, hicolor-icon-theme"
 
 INSTALLED_SIZE="$(
     du -sk "$PACKAGE_ROOT" |
@@ -290,32 +325,64 @@ set -e
 
 SERVICE="app-com.cliph.ClipH.service"
 
-for runtime_dir in /run/user/[0-9]*; do
-    [ -d "$runtime_dir" ] || continue
-    [ -S "$runtime_dir/bus" ] || continue
+case "${1:-}" in
+    configure|abort-upgrade|abort-deconfigure|abort-remove)
+        if [ -z "${DPKG_ROOT:-}" ] &&
+           command -v deb-systemd-helper >/dev/null 2>&1; then
 
-    uid="${runtime_dir##*/}"
-    username="$(getent passwd "$uid" | cut -d: -f1)"
+            deb-systemd-helper \
+                --user \
+                unmask "$SERVICE" \
+                >/dev/null ||
+                true
 
-    [ -n "$username" ] || continue
+            # Sur une première installation, was-enabled vaut vrai.
+            # Sur une mise à jour, le choix de l'utilisateur est conservé.
+            if deb-systemd-helper \
+                --quiet \
+                --user \
+                was-enabled "$SERVICE"
+            then
+                deb-systemd-helper \
+                    --user \
+                    enable "$SERVICE" \
+                    >/dev/null ||
+                    true
+            else
+                deb-systemd-helper \
+                    --user \
+                    update-state "$SERVICE" \
+                    >/dev/null ||
+                    true
+            fi
+        fi
+        ;;
+esac
 
-    runuser -u "$username" -- \
-        env \
-        XDG_RUNTIME_DIR="$runtime_dir" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus" \
-        systemctl --user daemon-reload ||
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache \
+        --force \
+        --ignore-theme-index \
+        /usr/share/icons/hicolor ||
         true
-
-    runuser -u "$username" -- \
-        env \
-        XDG_RUNTIME_DIR="$runtime_dir" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus" \
-        systemctl --user restart "$SERVICE" ||
-        true
-done
+fi
 
 if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database /usr/share/applications || true
+    update-desktop-database \
+        /usr/share/applications ||
+        true
+fi
+
+if command -v deb-systemd-invoke >/dev/null 2>&1; then
+    deb-systemd-invoke \
+        --user \
+        daemon-reload ||
+        true
+
+    deb-systemd-invoke \
+        --user \
+        restart "$SERVICE" ||
+        true
 fi
 
 exit 0
@@ -327,24 +394,13 @@ set -e
 
 SERVICE="app-com.cliph.ClipH.service"
 
-if [ "${1:-}" = "remove" ]; then
-    for runtime_dir in /run/user/[0-9]*; do
-        [ -d "$runtime_dir" ] || continue
-        [ -S "$runtime_dir/bus" ] || continue
-
-        uid="${runtime_dir##*/}"
-        username="$(getent passwd "$uid" | cut -d: -f1)"
-
-        [ -n "$username" ] || continue
-
-        runuser -u "$username" -- \
-            env \
-            XDG_RUNTIME_DIR="$runtime_dir" \
-            DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus" \
-            systemctl --user stop "$SERVICE" ||
-            true
-    done
-fi
+case "${1:-}" in
+    remove|deconfigure)
+        if command -v deb-systemd-invoke >/dev/null 2>&1; then
+            deb-systemd-invoke --user stop "$SERVICE" || true
+        fi
+        ;;
+esac
 
 exit 0
 EOF
@@ -353,25 +409,38 @@ cat > "$PACKAGE_ROOT/DEBIAN/postrm" <<'EOF'
 #!/bin/sh
 set -e
 
-for runtime_dir in /run/user/[0-9]*; do
-    [ -d "$runtime_dir" ] || continue
-    [ -S "$runtime_dir/bus" ] || continue
+SERVICE="app-com.cliph.ClipH.service"
 
-    uid="${runtime_dir##*/}"
-    username="$(getent passwd "$uid" | cut -d: -f1)"
+if [ "${1:-}" = "purge" ] &&
+   [ -z "${DPKG_ROOT:-}" ] &&
+   command -v deb-systemd-helper >/dev/null 2>&1; then
 
-    [ -n "$username" ] || continue
-
-    runuser -u "$username" -- \
-        env \
-        XDG_RUNTIME_DIR="$runtime_dir" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus" \
-        systemctl --user daemon-reload ||
+    deb-systemd-helper \
+        --user \
+        purge "$SERVICE" \
+        >/dev/null ||
         true
-done
+fi
+
+if command -v deb-systemd-invoke >/dev/null 2>&1; then
+    deb-systemd-invoke \
+        --user \
+        daemon-reload ||
+        true
+fi
+
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache \
+        --force \
+        --ignore-theme-index \
+        /usr/share/icons/hicolor ||
+        true
+fi
 
 if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database /usr/share/applications || true
+    update-desktop-database \
+        /usr/share/applications ||
+        true
 fi
 
 exit 0
@@ -386,13 +455,30 @@ chmod 0755 \
 (
     cd "$PACKAGE_ROOT"
 
-    find usr etc \
+    find usr \
         -type f \
         -print0 |
     sort -z |
     xargs -0 md5sum \
         > DEBIAN/md5sums
 )
+
+printf '◆ Normalisation des permissions Debian\n'
+
+find "$PACKAGE_ROOT" \
+    -type d \
+    -exec chmod 0755 {} +
+
+find "$PACKAGE_ROOT" \
+    -type f \
+    -exec chmod 0644 {} +
+
+chmod 0755 \
+    "$PACKAGE_ROOT/usr/bin/$BINARY_INSTALL_NAME" \
+    "$PACKAGE_ROOT/DEBIAN/preinst" \
+    "$PACKAGE_ROOT/DEBIAN/postinst" \
+    "$PACKAGE_ROOT/DEBIAN/prerm" \
+    "$PACKAGE_ROOT/DEBIAN/postrm"
 
 printf '◆ Construction du paquet .deb\n'
 

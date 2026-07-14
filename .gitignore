@@ -9,3 +9,6 @@
 /backups/
 
 .cache/cliph-unicode/
+
+/dist/
+/target/

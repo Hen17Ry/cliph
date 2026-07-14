@@ -1,0 +1,11 @@
+cliph (0.1.0) unstable; urgency=medium
+
+  * Première version publique de ClipH.
+  * Ajout de l'historique local du presse-papiers.
+  * Prise en charge des textes, images, fichiers et contenus riches.
+  * Ajout du catalogue hors ligne d'emojis, kaomojis et symboles.
+  * Ajout du raccourci global Super/Windows + H.
+  * Ajout du démarrage automatique avec systemd utilisateur.
+  * Ajout du paquet Debian, de la documentation et de l'icône officielle.
+
+ -- Henry Gossou <Hen17Ry@users.noreply.github.com>  Tue, 14 Jul 2026 20:40:00 +0100

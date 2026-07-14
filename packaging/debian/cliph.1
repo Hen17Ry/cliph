@@ -1,0 +1,58 @@
+.TH CLIPH 1 "14 July 2026" "ClipH 0.1.0" "User Commands"
+.SH NAME
+cliph \- gestionnaire de presse-papiers rapide pour Linux
+.SH SYNOPSIS
+.B cliph
+.RI [ commande ]
+.SH DESCRIPTION
+.B ClipH
+conserve localement l'historique des textes, contenus riches, images et
+fichiers copiés.
+.PP
+L'application fournit aussi un catalogue hors ligne d'emojis, de kaomojis et
+de symboles Unicode.
+.PP
+Dans une session GNOME compatible, le raccourci
+.B Super+H
+affiche ou masque la fenêtre.
+.SH COMMANDES
+.TP
+.B install
+Installe ClipH pour l'utilisateur courant dans son répertoire personnel.
+Cette commande est destinée au développement ou à l'utilisation d'un binaire
+autonome. Elle ne doit pas être utilisée après l'installation du paquet Debian.
+.TP
+.B uninstall
+Supprime l'installation locale créée par
+.BR "cliph install" .
+Cette commande ne supprime pas un paquet installé avec APT.
+.TP
+.B status
+Affiche l'état de l'installation locale et du service utilisateur.
+.TP
+.B \-\-background
+Démarre ClipH en arrière-plan. Cette option est utilisée par le service
+systemd utilisateur.
+.TP
+.B \-\-version
+Affiche la version de ClipH.
+.TP
+.B \-\-help
+Affiche l'aide de la ligne de commande.
+.SH FICHIERS
+.TP
+.I ~/.local/share/cliph/
+Données locales et historique de l'utilisateur.
+.TP
+.I /usr/lib/systemd/user/app-com.cliph.ClipH.service
+Service utilisateur installé par le paquet Debian.
+.TP
+.I /usr/share/applications/com.cliph.ClipH.desktop
+Lanceur de bureau.
+.SH RACCOURCI
+.B Super/Windows + H
+.SH AUTEUR
+Henry Gossou.
+.SH VOIR AUSSI
+.BR systemctl (1),
+.BR journalctl (1)
