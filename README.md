@@ -28,3 +28,9 @@ ClipH est un gestionnaire moderne et persistant de presse-papiers conçu pour Li
 ## État actuel
 
 Initialisation du socle graphique de l'application.
+
+## Raccourcis
+
+- **Super/Windows + H** : affiche ou masque ClipH.
+- **Ctrl + Super/Windows + H** : raccourci de secours utilisé lorsque
+  Super+H est déjà occupé par l’environnement de bureau.
