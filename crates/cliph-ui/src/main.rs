@@ -233,19 +233,6 @@ fn publish_item_to_clipboard(
                 ));
             }
 
-            /*
-             * Nautilus sous GTK 4 utilise la représentation native
-             * GdkFileList. Les formats MIME restent publiés pour les
-             * autres applications et pour la compatibilité GNOME.
-             */
-            let gio_files = available_uris
-                .iter()
-                .map(|uri| gio::File::for_uri(uri))
-                .collect::<Vec<_>>();
-
-            let file_list = gdk::FileList::from_array(&gio_files);
-            let file_list_value = file_list.to_value();
-
             let uri_list = format!("{}\r\n", available_uris.join("\r\n"));
 
             /*
@@ -258,13 +245,46 @@ fn publish_item_to_clipboard(
 
             let gnome_bytes = glib::Bytes::from_owned(gnome_copied_files.into_bytes());
 
-            let providers = [
-                gdk::ContentProvider::for_value(&file_list_value),
-                gdk::ContentProvider::for_bytes("text/uri-list", &uri_list_bytes),
-                gdk::ContentProvider::for_bytes("x-special/gnome-copied-files", &gnome_bytes),
-            ];
+            /*
+             * GTK 4.8 et versions supérieures disposent du type
+             * natif GdkFileList, utilisé notamment par les versions
+             * modernes de Nautilus.
+             */
+            #[cfg(feature = "gtk-v4-8")]
+            let provider = {
+                let gio_files = available_uris
+                    .iter()
+                    .map(|uri| gio::File::for_uri(uri))
+                    .collect::<Vec<_>>();
 
-            let provider = gdk::ContentProvider::new_union(&providers);
+                let file_list = gdk::FileList::from_array(&gio_files);
+
+                let file_list_value = file_list.to_value();
+
+                let providers = [
+                    gdk::ContentProvider::for_value(&file_list_value),
+                    gdk::ContentProvider::for_bytes("text/uri-list", &uri_list_bytes),
+                    gdk::ContentProvider::for_bytes("x-special/gnome-copied-files", &gnome_bytes),
+                ];
+
+                gdk::ContentProvider::new_union(&providers)
+            };
+
+            /*
+             * GTK 4.6 ne fournit pas encore GdkFileList.
+             * Les formats MIME standards permettent néanmoins
+             * de copier et coller des fichiers dans les
+             * gestionnaires de fichiers compatibles.
+             */
+            #[cfg(not(feature = "gtk-v4-8"))]
+            let provider = {
+                let providers = [
+                    gdk::ContentProvider::for_bytes("text/uri-list", &uri_list_bytes),
+                    gdk::ContentProvider::for_bytes("x-special/gnome-copied-files", &gnome_bytes),
+                ];
+
+                gdk::ContentProvider::new_union(&providers)
+            };
 
             clipboard
                 .set_content(Some(&provider))
