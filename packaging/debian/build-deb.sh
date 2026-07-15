@@ -12,6 +12,39 @@ BINARY_INSTALL_NAME="cliph"
 MAINTAINER="Henry Gossou <Hen17Ry@users.noreply.github.com>"
 HOMEPAGE="https://github.com/Hen17Ry"
 
+BUILD_PROFILE="${CLIPH_BUILD_PROFILE:-modern}"
+PACKAGE_VARIANT="${CLIPH_PACKAGE_VARIANT:-}"
+
+case "$BUILD_PROFILE" in
+    modern)
+        CARGO_BUILD_ARGS=(
+            --release
+            -p "$BINARY_CRATE"
+            --no-default-features
+            --features "$BINARY_CRATE/gtk-v4-8"
+        )
+        ;;
+    legacy)
+        CARGO_BUILD_ARGS=(
+            --release
+            -p "$BINARY_CRATE"
+            --no-default-features
+        )
+        ;;
+    *)
+        printf 'Profil de compilation inconnu : %s\n'             "$BUILD_PROFILE" >&2
+        printf 'Profils acceptés : modern, legacy\n' >&2
+        exit 1
+        ;;
+esac
+
+if [[ -n "$PACKAGE_VARIANT" ]] &&
+   [[ ! "$PACKAGE_VARIANT" =~ ^[A-Za-z0-9._+-]+$ ]]
+then
+    printf 'Variante de paquet invalide : %s\n'         "$PACKAGE_VARIANT" >&2
+    exit 1
+fi
+
 PROJECT_ROOT="$(
     cd "$(dirname "${BASH_SOURCE[0]}")/../.." &&
     pwd
@@ -62,11 +95,23 @@ else:
 )"
 
 ARCHITECTURE="$(dpkg --print-architecture)"
-BUILD_ROOT="$PROJECT_ROOT/target/debian-package"
-PACKAGE_ROOT="$BUILD_ROOT/${PACKAGE_NAME}_${VERSION}_${ARCHITECTURE}"
+
+CARGO_TARGET_DIRECTORY="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+
+BUILD_ROOT="$CARGO_TARGET_DIRECTORY/debian-package"
 OUTPUT_DIRECTORY="$PROJECT_ROOT/dist"
-OUTPUT_FILE="$OUTPUT_DIRECTORY/${PACKAGE_NAME}_${VERSION}_${ARCHITECTURE}.deb"
-RELEASE_BINARY="$PROJECT_ROOT/target/release/$BINARY_SOURCE_NAME"
+
+VARIANT_SUFFIX=""
+
+if [[ -n "$PACKAGE_VARIANT" ]]; then
+    VARIANT_SUFFIX="_$PACKAGE_VARIANT"
+fi
+
+PACKAGE_ROOT="${BUILD_ROOT}/${PACKAGE_NAME}_${VERSION}${VARIANT_SUFFIX}_${ARCHITECTURE}"
+
+OUTPUT_FILE="${OUTPUT_DIRECTORY}/${PACKAGE_NAME}_${VERSION}${VARIANT_SUFFIX}_${ARCHITECTURE}.deb"
+
+RELEASE_BINARY="$CARGO_TARGET_DIRECTORY/release/$BINARY_SOURCE_NAME"
 
 printf '\n'
 printf '╭──────────────────────────────────────────────╮\n'
@@ -75,11 +120,13 @@ printf '╰───────────────────────
 printf '\n'
 printf 'Version       : %s\n' "$VERSION"
 printf 'Architecture  : %s\n' "$ARCHITECTURE"
+printf 'Profil GTK    : %s\n' "$BUILD_PROFILE"
+printf 'Variante      : %s\n' "${PACKAGE_VARIANT:-générique}"
 printf 'Sortie        : %s\n' "$OUTPUT_FILE"
 printf '\n'
 
 printf '◆ Compilation release\n'
-cargo build --release -p "$BINARY_CRATE"
+cargo build "${CARGO_BUILD_ARGS[@]}"
 
 if [[ ! -x "$RELEASE_BINARY" ]]; then
     printf 'Binaire release introuvable : %s\n' "$RELEASE_BINARY" >&2
