@@ -1546,7 +1546,7 @@ fn toggle_application_window(app: &adw::Application, activation_timestamp: Optio
 
     if window.is_visible() {
         window.hide();
-return;
+        return;
     }
 
     if let Some(timestamp) = activation_timestamp {
@@ -1600,7 +1600,7 @@ async fn run_portal_global_shortcut(
         .map_err(|error| format!("impossible d’écouter les activations : {error}",))?;
 
     while let Some(activation) = activations.next().await {
-if activation.shortcut_id() != PORTAL_SHORTCUT_ID {
+        if activation.shortcut_id() != PORTAL_SHORTCUT_ID {
             continue;
         }
 
