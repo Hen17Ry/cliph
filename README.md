@@ -14,7 +14,7 @@ ClipH est un gestionnaire moderne et persistant de presse-papiers conçu pour Li
 - GIF
 - Kaomojis
 - Symboles spéciaux
-- Ouverture avec Super + H
+- Ouverture avec Super + P
 
 ## Technologies
 
@@ -27,7 +27,15 @@ ClipH est un gestionnaire moderne et persistant de presse-papiers conçu pour Li
 
 ## État actuel
 
-Initialisation du socle graphique de l'application.
+ClipH 0.2.0 est fonctionnel et distribué aux formats Flatpak et Debian.
+
+Fonctionnalités principales :
+
+- historique persistant du presse-papiers ;
+- prise en charge des textes, images et fichiers ;
+- raccourci global Super + P ;
+- exécution en arrière-plan ;
+- démarrage automatique à l'ouverture de session.
 
 ## Raccourcis
 
