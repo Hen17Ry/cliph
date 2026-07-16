@@ -8,6 +8,10 @@ authors.workspace = true
 
 [dependencies]
 adw.workspace = true
+ashpd.workspace = true
+futures-util.workspace = true
+async-channel.workspace = true
+async-io.workspace = true
 gtk.workspace = true
 cliph-core = { path = "../cliph-core" }
 cliph-storage = { path = "../cliph-storage" }

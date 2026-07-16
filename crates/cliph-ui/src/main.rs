@@ -8,11 +8,14 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
+use ashpd::desktop::background::Background;
+use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
 use cliph_core::{
     ClipboardClassification, ClipboardFormatPayload, ClipboardItem, ClipboardItemKind, FilePayload,
     FileTransferOperation, QuickInsertCategory, QuickInsertEntry, search_entries,
 };
 use cliph_storage::{ClipboardStorage, MAX_FORMAT_PAYLOAD_BYTES, MAX_IMAGE_BYTES};
+use futures_util::StreamExt;
 use gtk::glib::types::StaticType;
 use gtk::{Align, Orientation, gdk, gio, glib};
 
@@ -28,6 +31,9 @@ const GNOME_CUSTOM_KEYBINDINGS_KEY: &str = "custom-keybindings";
 const CLIPH_GNOME_SHORTCUT_PATH: &str =
     "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/cliph/";
 const CLIPH_SHORTCUT_BINDING: &str = "<Super>p";
+
+const PORTAL_SHORTCUT_ID: &str = "toggle-cliph-super-p-v1";
+const PORTAL_SHORTCUT_TRIGGER: &str = "LOGO+P";
 
 const GNOME_MUTTER_KEYBINDINGS_SCHEMA: &str = "org.gnome.mutter.keybindings";
 const GNOME_SWITCH_MONITOR_KEY: &str = "switch-monitor";
@@ -1512,6 +1518,245 @@ fn show_startup_error(app: &adw::Application, message: &str) {
     window.present();
 }
 
+fn running_in_flatpak() -> bool {
+    std::env::var_os("FLATPAK_ID").is_some() || Path::new("/.flatpak-info").exists()
+}
+
+#[derive(Debug)]
+enum PortalShortcutEvent {
+    Ready(String),
+    Activated(u32),
+    Failed(String),
+}
+
+#[allow(deprecated)]
+fn present_window_from_shortcut(window: &gtk::Window, timestamp: u32) {
+    window.present_with_time(timestamp);
+}
+
+fn toggle_application_window(app: &adw::Application, activation_timestamp: Option<u32>) {
+    let window = app
+        .active_window()
+        .or_else(|| app.windows().into_iter().next());
+
+    let Some(window) = window else {
+        app.activate();
+        return;
+    };
+
+    if window.is_visible() {
+        window.hide();
+return;
+    }
+
+    if let Some(timestamp) = activation_timestamp {
+        present_window_from_shortcut(&window, timestamp);
+    } else {
+        window.present();
+    }
+}
+
+async fn run_portal_global_shortcut(
+    sender: async_channel::Sender<PortalShortcutEvent>,
+) -> Result<(), String> {
+    let portal = GlobalShortcuts::new()
+        .await
+        .map_err(|error| format!("impossible d’ouvrir le portail GlobalShortcuts : {error}",))?;
+
+    println!("Version du portail GlobalShortcuts : {}", portal.version(),);
+
+    let session = portal
+        .create_session(Default::default())
+        .await
+        .map_err(|error| format!("impossible de créer la session de raccourcis : {error}",))?;
+
+    let shortcut = NewShortcut::new(PORTAL_SHORTCUT_ID, "Afficher ou masquer ClipH")
+        .preferred_trigger(Some(PORTAL_SHORTCUT_TRIGGER));
+
+    let request = portal
+        .bind_shortcuts(&session, &[shortcut], None, Default::default())
+        .await
+        .map_err(|error| format!("impossible de demander le raccourci Super + P : {error}",))?;
+
+    let response = request
+        .response()
+        .map_err(|error| format!("la demande de raccourci a été refusée ou annulée : {error}",))?;
+
+    let trigger_description = response
+        .shortcuts()
+        .iter()
+        .find(|shortcut| shortcut.id() == PORTAL_SHORTCUT_ID)
+        .map(|shortcut| shortcut.trigger_description().to_owned())
+        .ok_or_else(|| String::from("le portail n’a attribué aucun raccourci à ClipH"))?;
+
+    sender
+        .send(PortalShortcutEvent::Ready(trigger_description))
+        .await
+        .map_err(|_| String::from("le canal GTK du raccourci est fermé"))?;
+
+    let mut activations = portal
+        .receive_activated()
+        .await
+        .map_err(|error| format!("impossible d’écouter les activations : {error}",))?;
+
+    while let Some(activation) = activations.next().await {
+if activation.shortcut_id() != PORTAL_SHORTCUT_ID {
+            continue;
+        }
+
+        let milliseconds = activation.timestamp().as_millis();
+
+        let timestamp = u32::try_from(milliseconds % (u128::from(u32::MAX) + 1)).unwrap_or(0);
+
+        sender
+            .send(PortalShortcutEvent::Activated(timestamp))
+            .await
+            .map_err(|_| String::from("le canal GTK du raccourci est fermé"))?;
+    }
+
+    let _ = session.close().await;
+
+    Err(String::from(
+        "le portail a interrompu l’écoute du raccourci",
+    ))
+}
+
+fn setup_portal_global_shortcut(app: &adw::Application, toast_overlay: &adw::ToastOverlay) {
+    let (sender, receiver) = async_channel::unbounded();
+
+    let thread_sender = sender.clone();
+
+    let thread_result = std::thread::Builder::new()
+        .name(String::from("cliph-global-shortcut"))
+        .spawn(move || {
+            let result = async_io::block_on(run_portal_global_shortcut(thread_sender.clone()));
+
+            if let Err(error) = result {
+                let _ = async_io::block_on(thread_sender.send(PortalShortcutEvent::Failed(error)));
+            }
+        });
+
+    if let Err(error) = thread_result {
+        let message = format!("impossible de démarrer l’écoute du portail : {error}",);
+
+        eprintln!("{message}");
+
+        show_toast(toast_overlay, "Impossible d’activer Super + P");
+
+        return;
+    }
+
+    let app = app.clone();
+    let toast_overlay = toast_overlay.clone();
+
+    glib::spawn_future_local(async move {
+        while let Ok(event) = receiver.recv().await {
+            match event {
+                PortalShortcutEvent::Ready(trigger_description) => {
+                    println!(
+                        "Raccourci ClipH actif via le portail : \
+                         {trigger_description}",
+                    );
+
+                    show_toast(&toast_overlay, "Super + P est maintenant attribué à ClipH");
+                }
+
+                PortalShortcutEvent::Activated(timestamp) => {
+                    toggle_application_window(&app, Some(timestamp));
+                }
+
+                PortalShortcutEvent::Failed(error) => {
+                    eprintln!(
+                        "Impossible d’activer Super + P via le portail : \
+                         {error}",
+                    );
+
+                    show_toast(&toast_overlay, "Impossible d’activer Super + P");
+
+                    break;
+                }
+            }
+        }
+    });
+}
+
+async fn request_flatpak_background_start() -> Result<(), String> {
+    let request = Background::request()
+        .reason(
+            "Garder ClipH actif pour surveiller le presse-papiers \
+             et répondre au raccourci Super + P",
+        )
+        .auto_start(true)
+        .command(["cliph", "--background"])
+        .dbus_activatable(false)
+        .send()
+        .await
+        .map_err(|error| format!("impossible d’ouvrir le portail Background : {error}",))?;
+
+    let response = request.response().map_err(|error| {
+        format!(
+            "la demande d’exécution en arrière-plan \
+                 a été refusée ou annulée : {error}",
+        )
+    })?;
+
+    println!(
+        "Exécution Flatpak en arrière-plan autorisée : {}",
+        response.run_in_background(),
+    );
+
+    println!(
+        "Démarrage automatique Flatpak autorisé : {}",
+        response.auto_start(),
+    );
+
+    if !response.run_in_background() {
+        return Err(String::from(
+            "l’exécution en arrière-plan n’a pas été autorisée",
+        ));
+    }
+
+    if !response.auto_start() {
+        return Err(String::from(
+            "le démarrage automatique n’a pas été autorisé",
+        ));
+    }
+
+    Ok(())
+}
+
+fn setup_flatpak_background_start() {
+    if !running_in_flatpak() {
+        return;
+    }
+
+    let thread_result = std::thread::Builder::new()
+        .name(String::from("cliph-background-portal"))
+        .spawn(move || {
+            let result = async_io::block_on(request_flatpak_background_start());
+
+            match result {
+                Ok(()) => {
+                    println!(
+                        "ClipH démarrera automatiquement \
+                         en arrière-plan.",
+                    );
+                }
+
+                Err(error) => {
+                    eprintln!(
+                        "Démarrage automatique Flatpak indisponible : \
+                         {error}",
+                    );
+                }
+            }
+        });
+
+    if let Err(error) = thread_result {
+        eprintln!("Impossible de démarrer la demande Background : {error}",);
+    }
+}
+
 fn shortcut_binding_is_super_p(binding: &str) -> bool {
     matches!(
         binding
@@ -1644,7 +1889,12 @@ fn install_gnome_super_p_shortcut() -> Result<usize, String> {
     Ok(released_shortcuts)
 }
 
-fn setup_global_shortcut(toast_overlay: &adw::ToastOverlay) {
+fn setup_global_shortcut(app: &adw::Application, toast_overlay: &adw::ToastOverlay) {
+    if running_in_flatpak() {
+        setup_portal_global_shortcut(app, toast_overlay);
+        return;
+    }
+
     match install_gnome_super_p_shortcut() {
         Ok(released_shortcuts) => {
             if released_shortcuts > 0 {
@@ -1967,7 +2217,8 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
         toast_overlay.clone(),
     );
 
-    setup_global_shortcut(&toast_overlay);
+    setup_global_shortcut(app, &toast_overlay);
+    setup_flatpak_background_start();
 
     if start_hidden {
         window.hide();
@@ -2015,19 +2266,7 @@ fn run_application() -> glib::ExitCode {
             return;
         }
 
-        let window = app
-            .active_window()
-            .or_else(|| app.windows().into_iter().next());
-
-        let Some(window) = window else {
-            return;
-        };
-
-        if window.is_visible() {
-            window.hide();
-        } else {
-            window.present();
-        }
+        toggle_application_window(app, None);
     });
 
     let exit_code = app.run_with_args(&["cliph"]);

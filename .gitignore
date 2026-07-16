@@ -12,3 +12,6 @@
 
 /dist/
 /target/
+/.flatpak-builder/
+/flatpak-build/
+/flatpak-repository/
