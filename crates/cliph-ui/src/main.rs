@@ -26,6 +26,15 @@ const GLOBAL_SHORTCUT_TRIGGER: &str = "LOGO+h";
 const FALLBACK_GLOBAL_SHORTCUT_ID: &str = "toggle-cliph-safe";
 const FALLBACK_GLOBAL_SHORTCUT_TRIGGER: &str = "CTRL+LOGO+h";
 
+const GNOME_GLOBAL_SHORTCUT_BINDING: &str = "<Super>h";
+const GNOME_FALLBACK_SHORTCUT_BINDING: &str = "<Control><Super>h";
+const GNOME_MEDIA_KEYS_SCHEMA: &str = "org.gnome.settings-daemon.plugins.media-keys";
+const GNOME_CUSTOM_KEYBINDING_SCHEMA: &str =
+    "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding";
+const GNOME_CUSTOM_KEYBINDINGS_KEY: &str = "custom-keybindings";
+const CLIPH_GNOME_SHORTCUT_PATH: &str =
+    "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/cliph/";
+
 const GNOME_WM_KEYBINDINGS_SCHEMA: &str = "org.gnome.desktop.wm.keybindings";
 const GNOME_MINIMIZE_KEY: &str = "minimize";
 const HTML_MIME_TYPES: &[&str] = &[
@@ -1556,32 +1565,105 @@ fn gnome_uses_super_h_for_minimize() -> bool {
         .any(|binding| shortcut_binding_is_super_h(binding.as_str()))
 }
 
+fn install_gnome_shortcut_fallback(binding: &str) -> Result<(), String> {
+    let Some(schema_source) = gio::SettingsSchemaSource::default() else {
+        return Err(String::from("la source des schémas GNOME est indisponible"));
+    };
+
+    for schema_id in [GNOME_MEDIA_KEYS_SCHEMA, GNOME_CUSTOM_KEYBINDING_SCHEMA] {
+        if schema_source.lookup(schema_id, true).is_none() {
+            return Err(format!("le schéma GNOME {schema_id} est indisponible",));
+        }
+    }
+
+    let media_keys = gio::Settings::new(GNOME_MEDIA_KEYS_SCHEMA);
+
+    let mut shortcut_paths = media_keys
+        .strv(GNOME_CUSTOM_KEYBINDINGS_KEY)
+        .iter()
+        .map(|path| path.as_str().to_owned())
+        .collect::<Vec<_>>();
+
+    if !shortcut_paths
+        .iter()
+        .any(|path| path == CLIPH_GNOME_SHORTCUT_PATH)
+    {
+        shortcut_paths.push(CLIPH_GNOME_SHORTCUT_PATH.to_owned());
+
+        let shortcut_path_refs = shortcut_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+
+        media_keys
+            .set_strv(GNOME_CUSTOM_KEYBINDINGS_KEY, shortcut_path_refs)
+            .map_err(|error| {
+                format!("impossible d’ajouter ClipH aux raccourcis GNOME : {error}",)
+            })?;
+    }
+
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("impossible de retrouver l’exécutable ClipH : {error}",))?;
+
+    let executable = executable.to_string_lossy();
+
+    let command = if executable.chars().any(char::is_whitespace) {
+        format!("'{}'", executable.replace('\'', "'\"'\"'"),)
+    } else {
+        executable.into_owned()
+    };
+
+    let shortcut =
+        gio::Settings::with_path(GNOME_CUSTOM_KEYBINDING_SCHEMA, CLIPH_GNOME_SHORTCUT_PATH);
+
+    shortcut
+        .set_string("name", "Afficher ou masquer ClipH")
+        .map_err(|error| format!("impossible de nommer le raccourci ClipH : {error}"))?;
+
+    shortcut
+        .set_string("command", &command)
+        .map_err(|error| format!("impossible de définir la commande ClipH : {error}"))?;
+
+    shortcut
+        .set_string("binding", binding)
+        .map_err(|error| format!("impossible de définir le raccourci ClipH : {error}"))?;
+
+    Ok(())
+}
+
 fn setup_global_shortcut(window: &adw::ApplicationWindow, toast_overlay: &adw::ToastOverlay) {
     let window = window.clone();
     let toast_overlay = toast_overlay.clone();
 
-    let (shortcut_id, shortcut_trigger, shortcut_label) = if gnome_uses_super_h_for_minimize() {
-        eprintln!(
-            "Windows + H est déjà utilisé par GNOME. \
+    let (shortcut_id, shortcut_trigger, shortcut_label, gnome_binding) =
+        if gnome_uses_super_h_for_minimize() {
+            eprintln!(
+                "Windows + H est déjà utilisé par GNOME. \
              ClipH utilisera Ctrl + Windows + H."
-        );
+            );
 
-        show_toast(
-            &toast_overlay,
-            "Windows + H est occupé — utilisez Ctrl + Windows + H",
-        );
+            show_toast(
+                &toast_overlay,
+                "Windows + H est occupé — utilisez Ctrl + Windows + H",
+            );
 
-        (
-            FALLBACK_GLOBAL_SHORTCUT_ID,
-            FALLBACK_GLOBAL_SHORTCUT_TRIGGER,
-            "Ctrl + Windows + H",
-        )
-    } else {
-        (GLOBAL_SHORTCUT_ID, GLOBAL_SHORTCUT_TRIGGER, "Windows + H")
-    };
+            (
+                FALLBACK_GLOBAL_SHORTCUT_ID,
+                FALLBACK_GLOBAL_SHORTCUT_TRIGGER,
+                "Ctrl + Windows + H",
+                GNOME_FALLBACK_SHORTCUT_BINDING,
+            )
+        } else {
+            (
+                GLOBAL_SHORTCUT_ID,
+                GLOBAL_SHORTCUT_TRIGGER,
+                "Windows + H",
+                GNOME_GLOBAL_SHORTCUT_BINDING,
+            )
+        };
 
     glib::MainContext::default().spawn_local(async move {
-        if let Err(error) = run_global_shortcut(
+        let portal_failure = match run_global_shortcut(
             window,
             toast_overlay.clone(),
             shortcut_id,
@@ -1590,12 +1672,35 @@ fn setup_global_shortcut(window: &adw::ApplicationWindow, toast_overlay: &adw::T
         )
         .await
         {
-            eprintln!("Impossible d’activer {shortcut_label} : {error}");
+            Ok(true) => return,
+            Ok(false) => {
+                format!("Le raccourci {shortcut_label} n’a pas été autorisé par le portail.",)
+            }
+            Err(error) => {
+                format!("Impossible d’activer {shortcut_label} avec le portail : {error}",)
+            }
+        };
 
-            show_toast(
-                &toast_overlay,
-                &format!("Impossible d’activer {shortcut_label}"),
-            );
+        eprintln!("{portal_failure}");
+        eprintln!("Tentative d’activation du raccourci GNOME natif.");
+
+        match install_gnome_shortcut_fallback(gnome_binding) {
+            Ok(()) => {
+                println!("Raccourci GNOME de secours actif : {shortcut_label}",);
+
+                show_toast(
+                    &toast_overlay,
+                    &format!("{shortcut_label} est actif via GNOME"),
+                );
+            }
+            Err(error) => {
+                eprintln!("Impossible d’activer le raccourci GNOME de secours : {error}",);
+
+                show_toast(
+                    &toast_overlay,
+                    &format!("Impossible d’activer {shortcut_label}"),
+                );
+            }
         }
     });
 }
@@ -1606,7 +1711,7 @@ async fn run_global_shortcut(
     shortcut_id: &'static str,
     shortcut_trigger: &'static str,
     shortcut_label: &'static str,
-) -> ashpd::Result<()> {
+) -> ashpd::Result<bool> {
     let portal = GlobalShortcuts::new().await?;
 
     println!("Version du portail GlobalShortcuts : {}", portal.version(),);
@@ -1635,7 +1740,7 @@ async fn run_global_shortcut(
             &format!("{shortcut_label} n’a pas été autorisé"),
         );
 
-        return Ok(());
+        return Ok(false);
     }
 
     let trigger_description = bind_response
@@ -1668,7 +1773,7 @@ async fn run_global_shortcut(
 
     drop(session);
 
-    Ok(())
+    Ok(true)
 }
 
 fn build_ui(app: &adw::Application, start_hidden: bool) {
@@ -1991,6 +2096,21 @@ fn run_application() -> glib::ExitCode {
     app.connect_activate(move |app| {
         if app.windows().is_empty() {
             build_ui(app, start_hidden);
+            return;
+        }
+
+        let window = app
+            .active_window()
+            .or_else(|| app.windows().into_iter().next());
+
+        let Some(window) = window else {
+            return;
+        };
+
+        if window.is_visible() {
+            window.hide();
+        } else {
+            window.present();
         }
     });
 
