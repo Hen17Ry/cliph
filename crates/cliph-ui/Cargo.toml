@@ -11,5 +11,3 @@ adw.workspace = true
 gtk.workspace = true
 cliph-core = { path = "../cliph-core" }
 cliph-storage = { path = "../cliph-storage" }
-ashpd.workspace = true
-futures-util.workspace = true

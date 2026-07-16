@@ -8,26 +8,29 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
-use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
 use cliph_core::{
     ClipboardClassification, ClipboardFormatPayload, ClipboardItem, ClipboardItemKind, FilePayload,
     FileTransferOperation, QuickInsertCategory, QuickInsertEntry, search_entries,
 };
 use cliph_storage::{ClipboardStorage, MAX_FORMAT_PAYLOAD_BYTES, MAX_IMAGE_BYTES};
-use futures_util::StreamExt;
 use gtk::glib::types::StaticType;
 use gtk::{Align, Orientation, gdk, gio, glib};
 
 const APP_ID: &str = "com.cliph.ClipH";
 const DISPLAYED_HISTORY_LIMIT: usize = 200;
-const GLOBAL_SHORTCUT_ID: &str = "toggle-cliph";
-const GLOBAL_SHORTCUT_TRIGGER: &str = "LOGO+h";
 
-const FALLBACK_GLOBAL_SHORTCUT_ID: &str = "toggle-cliph-safe";
-const FALLBACK_GLOBAL_SHORTCUT_TRIGGER: &str = "CTRL+LOGO+h";
+const GNOME_INTERFACE_SCHEMA: &str = "org.gnome.desktop.interface";
+const GNOME_COLOR_SCHEME_KEY: &str = "color-scheme";
+const GNOME_MEDIA_KEYS_SCHEMA: &str = "org.gnome.settings-daemon.plugins.media-keys";
+const GNOME_CUSTOM_KEYBINDING_SCHEMA: &str =
+    "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding";
+const GNOME_CUSTOM_KEYBINDINGS_KEY: &str = "custom-keybindings";
+const CLIPH_GNOME_SHORTCUT_PATH: &str =
+    "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/cliph/";
+const CLIPH_SHORTCUT_BINDING: &str = "<Super>p";
 
-const GNOME_WM_KEYBINDINGS_SCHEMA: &str = "org.gnome.desktop.wm.keybindings";
-const GNOME_MINIMIZE_KEY: &str = "minimize";
+const GNOME_MUTTER_KEYBINDINGS_SCHEMA: &str = "org.gnome.mutter.keybindings";
+const GNOME_SWITCH_MONITOR_KEY: &str = "switch-monitor";
 const HTML_MIME_TYPES: &[&str] = &[
     "text/html",
     "text/html;charset=utf-8",
@@ -1509,146 +1512,158 @@ fn show_startup_error(app: &adw::Application, message: &str) {
     window.present();
 }
 
-fn shortcut_binding_is_super_h(binding: &str) -> bool {
+fn shortcut_binding_is_super_p(binding: &str) -> bool {
     matches!(
-        binding.trim().to_ascii_lowercase().as_str(),
-        "<super>h" | "<meta>h"
+        binding
+            .trim()
+            .replace(' ', "")
+            .to_ascii_lowercase()
+            .as_str(),
+        "<super>p" | "<meta>p"
     )
 }
 
-fn gnome_uses_super_h_for_minimize() -> bool {
-    let Some(schema_source) = gio::SettingsSchemaSource::default() else {
-        return false;
-    };
+fn release_super_p_from_mutter() -> Result<usize, String> {
+    let settings = gio::Settings::new(GNOME_MUTTER_KEYBINDINGS_SCHEMA);
 
-    if schema_source
-        .lookup(GNOME_WM_KEYBINDINGS_SCHEMA, true)
-        .is_none()
-    {
-        return false;
+    let bindings = settings
+        .strv(GNOME_SWITCH_MONITOR_KEY)
+        .iter()
+        .map(|binding| binding.as_str().to_owned())
+        .collect::<Vec<_>>();
+
+    let remaining_bindings = bindings
+        .iter()
+        .filter(|binding| !shortcut_binding_is_super_p(binding))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let released_bindings = bindings.len() - remaining_bindings.len();
+
+    if released_bindings == 0 {
+        return Ok(0);
     }
 
-    let settings = gio::Settings::new(GNOME_WM_KEYBINDINGS_SCHEMA);
+    let remaining_binding_refs = remaining_bindings
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
 
     settings
-        .strv(GNOME_MINIMIZE_KEY)
-        .iter()
-        .any(|binding| shortcut_binding_is_super_h(binding.as_str()))
+        .set_strv(GNOME_SWITCH_MONITOR_KEY, remaining_binding_refs)
+        .map_err(|error| format!("impossible de libérer Super + P dans GNOME Mutter : {error}",))?;
+
+    Ok(released_bindings)
 }
 
-fn setup_global_shortcut(window: &adw::ApplicationWindow, toast_overlay: &adw::ToastOverlay) {
-    let window = window.clone();
-    let toast_overlay = toast_overlay.clone();
-
-    let (shortcut_id, shortcut_trigger, shortcut_label) = if gnome_uses_super_h_for_minimize() {
-        eprintln!(
-            "Windows + H est déjà utilisé par GNOME. \
-             ClipH utilisera Ctrl + Windows + H."
-        );
-
-        show_toast(
-            &toast_overlay,
-            "Windows + H est occupé — utilisez Ctrl + Windows + H",
-        );
-
-        (
-            FALLBACK_GLOBAL_SHORTCUT_ID,
-            FALLBACK_GLOBAL_SHORTCUT_TRIGGER,
-            "Ctrl + Windows + H",
-        )
-    } else {
-        (GLOBAL_SHORTCUT_ID, GLOBAL_SHORTCUT_TRIGGER, "Windows + H")
+fn install_gnome_super_p_shortcut() -> Result<usize, String> {
+    let Some(schema_source) = gio::SettingsSchemaSource::default() else {
+        return Err(String::from("la source des schémas GNOME est indisponible"));
     };
 
-    glib::MainContext::default().spawn_local(async move {
-        if let Err(error) = run_global_shortcut(
-            window,
-            toast_overlay.clone(),
-            shortcut_id,
-            shortcut_trigger,
-            shortcut_label,
-        )
-        .await
-        {
-            eprintln!("Impossible d’activer {shortcut_label} : {error}");
-
-            show_toast(
-                &toast_overlay,
-                &format!("Impossible d’activer {shortcut_label}"),
-            );
+    for schema_id in [
+        GNOME_MEDIA_KEYS_SCHEMA,
+        GNOME_CUSTOM_KEYBINDING_SCHEMA,
+        GNOME_MUTTER_KEYBINDINGS_SCHEMA,
+    ] {
+        if schema_source.lookup(schema_id, true).is_none() {
+            return Err(format!("le schéma GNOME {schema_id} est indisponible",));
         }
-    });
-}
-
-async fn run_global_shortcut(
-    window: adw::ApplicationWindow,
-    toast_overlay: adw::ToastOverlay,
-    shortcut_id: &'static str,
-    shortcut_trigger: &'static str,
-    shortcut_label: &'static str,
-) -> ashpd::Result<()> {
-    let portal = GlobalShortcuts::new().await?;
-
-    println!("Version du portail GlobalShortcuts : {}", portal.version(),);
-
-    let session = portal.create_session(Default::default()).await?;
-
-    let shortcut = NewShortcut::new(shortcut_id, "Afficher ou masquer ClipH")
-        .preferred_trigger(shortcut_trigger);
-
-    let bind_request = portal
-        .bind_shortcuts(&session, &[shortcut], None, Default::default())
-        .await?;
-
-    let bind_response = bind_request.response()?;
-
-    let shortcut_is_bound = bind_response
-        .shortcuts()
-        .iter()
-        .any(|shortcut| shortcut.id() == shortcut_id);
-
-    if !shortcut_is_bound {
-        eprintln!("Le raccourci {shortcut_label} n’a pas été autorisé.");
-
-        show_toast(
-            &toast_overlay,
-            &format!("{shortcut_label} n’a pas été autorisé"),
-        );
-
-        return Ok(());
     }
 
-    let trigger_description = bind_response
-        .shortcuts()
+    let media_keys = gio::Settings::new(GNOME_MEDIA_KEYS_SCHEMA);
+
+    let mut shortcut_paths = media_keys
+        .strv(GNOME_CUSTOM_KEYBINDINGS_KEY)
         .iter()
-        .find(|shortcut| shortcut.id() == shortcut_id)
-        .map(|shortcut| shortcut.trigger_description())
-        .unwrap_or(shortcut_label);
+        .map(|path| path.as_str().to_owned())
+        .collect::<Vec<_>>();
 
-    println!("Raccourci global actif : {trigger_description}");
+    let mut released_shortcuts = release_super_p_from_mutter()?;
 
-    show_toast(
-        &toast_overlay,
-        &format!("{shortcut_label} est maintenant actif"),
-    );
-
-    let mut activations = portal.receive_activated().await?;
-
-    while let Some(activation) = activations.next().await {
-        if activation.shortcut_id() != shortcut_id {
+    for shortcut_path in &shortcut_paths {
+        if shortcut_path == CLIPH_GNOME_SHORTCUT_PATH {
             continue;
         }
 
-        if window.is_visible() {
-            window.hide();
-        } else {
-            window.present();
+        let shortcut = gio::Settings::with_path(GNOME_CUSTOM_KEYBINDING_SCHEMA, shortcut_path);
+
+        let existing_binding = shortcut.string("binding");
+
+        if shortcut_binding_is_super_p(existing_binding.as_str()) {
+            shortcut.set_string("binding", "").map_err(|error| {
+                format!("impossible de libérer Super + P pour ClipH : {error}",)
+            })?;
+
+            released_shortcuts += 1;
         }
     }
 
-    drop(session);
+    if !shortcut_paths
+        .iter()
+        .any(|path| path == CLIPH_GNOME_SHORTCUT_PATH)
+    {
+        shortcut_paths.push(CLIPH_GNOME_SHORTCUT_PATH.to_owned());
 
-    Ok(())
+        let shortcut_path_refs = shortcut_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+
+        media_keys
+            .set_strv(GNOME_CUSTOM_KEYBINDINGS_KEY, shortcut_path_refs)
+            .map_err(|error| format!("impossible d’enregistrer le raccourci ClipH : {error}",))?;
+    }
+
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("impossible de retrouver l’exécutable ClipH : {error}",))?;
+
+    let executable = executable.to_string_lossy();
+
+    let command = if executable.chars().any(char::is_whitespace) {
+        format!("'{}'", executable.replace('\'', "'\"'\"'"),)
+    } else {
+        executable.into_owned()
+    };
+
+    let shortcut =
+        gio::Settings::with_path(GNOME_CUSTOM_KEYBINDING_SCHEMA, CLIPH_GNOME_SHORTCUT_PATH);
+
+    shortcut
+        .set_string("name", "Afficher ou masquer ClipH")
+        .map_err(|error| format!("impossible de nommer le raccourci ClipH : {error}"))?;
+
+    shortcut
+        .set_string("command", &command)
+        .map_err(|error| format!("impossible de définir la commande ClipH : {error}"))?;
+
+    shortcut
+        .set_string("binding", CLIPH_SHORTCUT_BINDING)
+        .map_err(|error| format!("impossible d’attribuer Super + P à ClipH : {error}"))?;
+
+    Ok(released_shortcuts)
+}
+
+fn setup_global_shortcut(toast_overlay: &adw::ToastOverlay) {
+    match install_gnome_super_p_shortcut() {
+        Ok(released_shortcuts) => {
+            if released_shortcuts > 0 {
+                println!(
+                    "{released_shortcuts} ancien raccourci utilisant \
+                     Super + P a été libéré.",
+                );
+            }
+
+            println!("Raccourci ClipH actif : Super + P");
+
+            show_toast(toast_overlay, "Super + P est maintenant attribué à ClipH");
+        }
+        Err(error) => {
+            eprintln!("Impossible d’activer le raccourci Super + P : {error}",);
+
+            show_toast(toast_overlay, "Impossible d’activer Super + P");
+        }
+    }
 }
 
 fn build_ui(app: &adw::Application, start_hidden: bool) {
@@ -1952,7 +1967,7 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
         toast_overlay.clone(),
     );
 
-    setup_global_shortcut(&window, &toast_overlay);
+    setup_global_shortcut(&toast_overlay);
 
     if start_hidden {
         window.hide();
@@ -1961,20 +1976,65 @@ fn build_ui(app: &adw::Application, start_hidden: bool) {
     }
 }
 
+fn apply_system_color_scheme(settings: &gio::Settings) {
+    let preference = settings.string(GNOME_COLOR_SCHEME_KEY);
+
+    let (color_scheme, label) = match preference.as_str() {
+        "prefer-dark" => (adw::ColorScheme::PreferDark, "sombre"),
+        "prefer-light" => (adw::ColorScheme::PreferLight, "clair"),
+        _ => (adw::ColorScheme::Default, "automatique"),
+    };
+
+    adw::StyleManager::default().set_color_scheme(color_scheme);
+
+    println!("Thème ClipH actif : {label} ({preference})",);
+}
+
 fn run_application() -> glib::ExitCode {
     let start_hidden = std::env::args_os().any(|argument| argument == "--background");
 
     let app = adw::Application::builder().application_id(APP_ID).build();
+
+    let interface_settings = gio::Settings::new(GNOME_INTERFACE_SCHEMA);
+
+    let settings_for_startup = interface_settings.clone();
+
+    app.connect_startup(move |_| {
+        apply_system_color_scheme(&settings_for_startup);
+    });
+
+    interface_settings.connect_changed(Some(GNOME_COLOR_SCHEME_KEY), move |settings, _| {
+        apply_system_color_scheme(settings);
+    });
 
     let _hold_guard = app.hold();
 
     app.connect_activate(move |app| {
         if app.windows().is_empty() {
             build_ui(app, start_hidden);
+            return;
+        }
+
+        let window = app
+            .active_window()
+            .or_else(|| app.windows().into_iter().next());
+
+        let Some(window) = window else {
+            return;
+        };
+
+        if window.is_visible() {
+            window.hide();
+        } else {
+            window.present();
         }
     });
 
-    app.run_with_args(&["cliph"])
+    let exit_code = app.run_with_args(&["cliph"]);
+
+    drop(interface_settings);
+
+    exit_code
 }
 
 fn main() -> glib::ExitCode {
@@ -1987,27 +2047,27 @@ fn main() -> glib::ExitCode {
 
 #[cfg(test)]
 mod shortcut_tests {
-    use super::shortcut_binding_is_super_h;
+    use super::shortcut_binding_is_super_p;
 
     #[test]
-    fn detects_gnome_super_h_binding() {
-        assert!(shortcut_binding_is_super_h("<Super>h",));
+    fn detects_gnome_super_p_binding() {
+        assert!(shortcut_binding_is_super_p("<Super>p"));
     }
 
     #[test]
-    fn detects_meta_h_binding() {
-        assert!(shortcut_binding_is_super_h("<Meta>h",));
+    fn detects_meta_p_binding() {
+        assert!(shortcut_binding_is_super_p("<Meta>p"));
     }
 
     #[test]
     fn detection_is_case_insensitive() {
-        assert!(shortcut_binding_is_super_h("<SUPER>H",));
+        assert!(shortcut_binding_is_super_p("<SUPER>P"));
     }
 
     #[test]
     fn ignores_unrelated_shortcuts() {
-        assert!(!shortcut_binding_is_super_h("<Control><Super>h",));
-
-        assert!(!shortcut_binding_is_super_h("<Super>j",));
+        assert!(!shortcut_binding_is_super_p("<Super>h"));
+        assert!(!shortcut_binding_is_super_p("<Control><Super>p"));
+        assert!(!shortcut_binding_is_super_p("<Super>Page_Up"));
     }
 }

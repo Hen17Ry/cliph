@@ -31,6 +31,6 @@ Initialisation du socle graphique de l'application.
 
 ## Raccourcis
 
-- **Super/Windows + H** : affiche ou masque ClipH.
-- **Ctrl + Super/Windows + H** : raccourci de secours utilisé lorsque
-  Super+H est déjà occupé par l’environnement de bureau.
+- **Super/Windows + P** : affiche ou masque ClipH.
+- Sous GNOME, ClipH libère automatiquement cette combinaison tout en
+  conservant le raccourci matériel `XF86Display`.

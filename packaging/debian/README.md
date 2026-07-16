@@ -34,7 +34,7 @@ sudo apt install ./dist/cliph_0.1.0_amd64.deb
 systemctl --user status app-com.cliph.ClipH.service --no-pager
 ```
 
-Le raccourci est `Super/Windows + H`.
+Le raccourci est `Super/Windows + P`.
 
 ## Désinstallation
 

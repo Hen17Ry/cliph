@@ -10,11 +10,11 @@ Toutes les modifications notables de ClipH sont documentées ici.
 - Classification automatique des contenus copiés.
 - Recherche rapide dans l’historique.
 - Catalogue hors ligne d’emojis, kaomojis et symboles Unicode.
-- Ouverture globale avec le raccourci Super/Windows + H.
+- Ouverture globale avec le raccourci Super/Windows + P.
 - Démarrage automatique dans la session graphique.
 - Installateur local avec les commandes `install`, `uninstall` et `status`.
 - Paquet Debian pour Ubuntu, Debian et leurs distributions dérivées.
 - Identité visuelle et icône officielle de ClipH.
 - Bannière d’installation « CLIPH BY HENRY GOSSOU ».
-- Détection du conflit entre `Super+H` et le raccourci GNOME de réduction des fenêtres.
-- Utilisation automatique de `Ctrl+Super+H` lorsque `Super+H` est déjà occupé.
+- Attribution automatique de `Super+P` à ClipH sous GNOME.
+- Adaptation automatique de ClipH au thème clair ou sombre du système.

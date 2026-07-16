@@ -96,6 +96,11 @@ mkdir -p \
     "$OUTPUT_DIRECTORY" \
     "$BUILD_ROOT/debian"
 
+
+install -Dm755 \
+    "$PROJECT_ROOT/packaging/debian/install-cliph.sh" \
+    "$OUTPUT_DIRECTORY/install-cliph.sh"
+
 install -Dm755 \
     "$RELEASE_BINARY" \
     "$PACKAGE_ROOT/usr/bin/$BINARY_INSTALL_NAME"
@@ -166,9 +171,10 @@ ClipH pour Debian et Ubuntu
 
 ClipH démarre automatiquement à l'ouverture d'une session graphique.
 
-Raccourcis :
-  Super/Windows + H
-  Ctrl + Super/Windows + H lorsque le raccourci principal est occupé
+Raccourci :
+  Super/Windows + P
+
+ClipH réserve automatiquement cette combinaison sous GNOME.
 
 Commandes utiles :
   cliph --version
@@ -248,7 +254,7 @@ Homepage: $HOMEPAGE
 Description: Gestionnaire de presse-papiers rapide pour Linux
  ClipH conserve l'historique des textes, contenus riches, images et
  fichiers copiés. Il fournit également un panneau hors ligne pour les
- emojis, kaomojis et symboles Unicode, accessible avec Super+H.
+ emojis, kaomojis et symboles Unicode, accessible avec Super+P.
 EOF
 
 cat > "$PACKAGE_ROOT/DEBIAN/preinst" <<'EOF'
