@@ -1,44 +1,58 @@
 # ClipH
 
-ClipH est un gestionnaire moderne et persistant de presse-papiers conçu pour Linux.
+ClipH is a modern persistent clipboard manager designed for Linux.
 
-## Objectifs
+It keeps a history of copied content and allows users to quickly reopen their clipboard history with a global shortcut.
 
-- Historique persistant du presse-papiers
-- Texte simple et texte enrichi
-- Code source
-- Liens
+## Why ClipH?
+
+Linux users often need a simple, fast, and persistent clipboard history that works across daily workflows. ClipH aims to provide a clean desktop experience while supporting multiple content types and modern Linux environments.
+
+## Features
+
+- Persistent clipboard history
+- Plain text and rich text support
+- Source code snippets
+- Links
 - Images
-- Documents et fichiers
-- Émojis
-- GIF
+- Documents and files
+- Emojis
+- GIFs
 - Kaomojis
-- Symboles spéciaux
-- Ouverture avec Super + P
+- Special symbols
+- Global shortcut: `Super + P`
+- Background execution
+- Auto-start at login
+- Wayland and X11 support
 
-## Technologies
+## Tech Stack
 
 - Rust
 - GTK 4
 - Libadwaita
 - SQLite
 - D-Bus
-- Wayland et X11
+- Wayland / X11
+- Flatpak
+- Debian packaging
 
-## État actuel
+## Current Status
 
-ClipH 0.2.0 est fonctionnel et distribué aux formats Flatpak et Debian.
+ClipH `0.2.0` is functional and distributed in Flatpak and Debian formats.
 
-Fonctionnalités principales :
+## Shortcut
 
-- historique persistant du presse-papiers ;
-- prise en charge des textes, images et fichiers ;
-- raccourci global Super + P ;
-- exécution en arrière-plan ;
-- démarrage automatique à l'ouverture de session.
+- `Super / Windows + P`: show or hide ClipH.
 
-## Raccourcis
+On GNOME, ClipH automatically frees this key combination while preserving the hardware shortcut `XF86Display`.
 
-- **Super/Windows + P** : affiche ou masque ClipH.
-- Sous GNOME, ClipH libère automatiquement cette combinaison tout en
-  conservant le raccourci matériel `XF86Display`.
+## Project Goals
+
+- Provide a reliable clipboard history for Linux users
+- Offer a clean and native desktop experience
+- Support multiple content types beyond plain text
+- Remain lightweight, practical, and easy to use
+
+## Author
+
+Developed by [Henry GOSSOU](https://github.com/Hen17Ry).
